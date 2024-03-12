@@ -1,0 +1,531 @@
+commit 6061c4e901c416d72b9cd3cd70d79c67ef0f8dd6
+Author: Nick Kossifidis <mick@ics.forth.gr>
+Date:   Tue Mar 12 18:09:04 2024 +0200
+
+    Add FCS patch from BSC
+
+diff --git include/linux/sched.h include/linux/sched.h
+index 292c31697..e5117dfa7 100644
+--- include/linux/sched.h
++++ include/linux/sched.h
+@@ -743,6 +743,19 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++#define FCS_FLAGS_NONE         0
++#define FCS_FLAGS_USERMASK     1
++#define FCS_FLAGS_CGROUP_CHECK 2
++struct fcs {
++	int state;
++	union {
++		cpumask_t *cpumaskp;
++		cpumask_t cpumask;
++	};
++	char flags;
++	spinlock_t lock;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -1544,6 +1557,8 @@ struct task_struct {
+ 	struct user_event_mm		*user_event_mm;
+ #endif
+ 
++	struct fcs fcs;
++
+ 	/*
+ 	 * New fields for task_struct should be added above here, so that
+ 	 * they are included in the randomized portion of task_struct.
+diff --git include/linux/syscalls.h include/linux/syscalls.h
+index 59fdd4074..cbdb44ba3 100644
+--- include/linux/syscalls.h
++++ include/linux/syscalls.h
+@@ -950,6 +950,8 @@ asmlinkage long sys_cachestat(unsigned int fd,
+ 		struct cachestat_range __user *cstat_range,
+ 		struct cachestat __user *cstat, unsigned int flags);
+ asmlinkage long sys_map_shadow_stack(unsigned long addr, unsigned long size, unsigned int flags);
++asmlinkage long sys_fcs(pid_t pid, unsigned int len, unsigned long __user
++			*user_mask_ptr, unsigned long flags);
+ 
+ /*
+  * Architecture-specific system calls
+diff --git include/uapi/asm-generic/unistd.h include/uapi/asm-generic/unistd.h
+index 756b013fb..a81e052a8 100644
+--- include/uapi/asm-generic/unistd.h
++++ include/uapi/asm-generic/unistd.h
+@@ -828,9 +828,11 @@ __SYSCALL(__NR_futex_wake, sys_futex_wake)
+ __SYSCALL(__NR_futex_wait, sys_futex_wait)
+ #define __NR_futex_requeue 456
+ __SYSCALL(__NR_futex_requeue, sys_futex_requeue)
++#define __NR_fcs 457
++__SYSCALL(__NR_fcs, sys_fcs)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 457
++#define __NR_syscalls 458
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git kernel/sched/core.c kernel/sched/core.c
+index a708d225c..71c8b785f 100644
+--- kernel/sched/core.c
++++ kernel/sched/core.c
+@@ -4480,6 +4480,8 @@ int wake_up_state(struct task_struct *p, unsigned int state)
+ 	return try_to_wake_up(p, state, 0);
+ }
+ 
++static void fcs_init(struct task_struct *p);
++
+ /*
+  * Perform scheduler related setup for a newly forked process p.
+  * p is forked by current.
+@@ -4533,6 +4535,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->migration_pending = NULL;
+ #endif
+ 	init_sched_mm_cid(p);
++	fcs_init(p);
+ }
+ 
+ DEFINE_STATIC_KEY_FALSE(sched_numa_balancing);
+@@ -8368,6 +8371,40 @@ __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
+ 	return retval;
+ }
+ 
++static int
++fcs_sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
++{
++	int retval;
++	cpumask_var_t cpus_allowed, new_mask;
++
++	if (!alloc_cpumask_var(&cpus_allowed, GFP_KERNEL))
++		return -ENOMEM;
++
++	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL)) {
++		retval = -ENOMEM;
++		goto out_free_cpus_allowed;
++	}
++
++	cpumask_copy(new_mask, ctx->new_mask);
++
++	ctx->new_mask = new_mask;
++	ctx->flags |= SCA_CHECK;
++
++	retval = dl_task_check_affinity(p, new_mask);
++	if (retval)
++		goto out_free_new_mask;
++
++	retval = __set_cpus_allowed_ptr(p, ctx);
++	if (retval)
++		goto out_free_new_mask;
++
++out_free_new_mask:
++	free_cpumask_var(new_mask);
++out_free_cpus_allowed:
++	free_cpumask_var(cpus_allowed);
++	return retval;
++}
++
+ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ {
+ 	struct affinity_context ac;
+@@ -9117,6 +9154,387 @@ SYSCALL_DEFINE2(sched_rr_get_interval_time32, pid_t, pid,
+ }
+ #endif
+ 
++#define FCS_STATE_RUNNING 0
++#define FCS_STATE_WAITING 1
++#define FCS_STATE_WAKING  2
++#define FCS_STATE_NOWAIT  3
++
++static void fcs_init(struct task_struct *p)
++{
++	spin_lock_init(&p->fcs.lock);
++	p->fcs.state = FCS_STATE_RUNNING;
++	p->fcs.cpumaskp = NULL;
++	p->fcs.flags = FCS_FLAGS_NONE;
++}
++
++static int do_fcs(struct task_struct *p, cpumask_t *in_mask,
++		  char do_block);
++
++static long fcs_restart(struct restart_block *restart)
++{
++	restart->fn = do_no_restart_syscall;
++	// we call it with current to avoid waking someone else
++	return do_fcs(current, NULL, 1);
++}
++
++
++static int fcs_wake(struct task_struct *p, cpumask_t *in_mask)
++{
++	int cpu;
++	int ret;
++	struct affinity_context ac;
++	int current_cpu = smp_processor_id();
++	cpumask_t *cpumaskp;
++
++	// This thread might block at the end of this function. We disable
++	// preemption here to avoid a scheduling point to preempt us before
++	// reaching the blocking point. We do so for performance, to avoid
++	// spurious wake ups.
++	preempt_disable();
++
++	// wake up a thread
++	if (p != current) {
++		spin_lock(&p->fcs.lock);
++		if (p->fcs.state == FCS_STATE_WAITING) {
++			// The thread that we want to wake up has marked itself
++			// as waiting to be woken up already. At this point, the
++			// theread might be still on the runqueue (about to
++			// schedule) or might have already been removed from it.
++			//
++			// If it has been removed from it, it this is the ideal
++			// place to change it's affinity before waking it up.
++			//
++			// If it is still running, it might seem risky migrating
++			// it to this cpu right now because it might preempt us,
++			// but this is really not possible because preemption on
++			// this core is disabled right now. In the worse case,
++			// we will migrate a thread that is about to call
++			// schedule.  But the good news is that in this case,
++			// the thread will not easily preempt us (it could
++			// preempt us just when we call preempt_enable(), but we
++			// are careful and call instead
++			// preempt_enable_no_resched(). It could still happen if
++			// a timer interrupt arrives just after we drop
++			// preemption, but it is highly unlikely.
++
++			p->fcs.state = FCS_STATE_WAKING;
++
++			// As soon as we drop this lock, the thread that we want
++			// to wake up might return to user-space if it gets a
++			// spurious wake up and sees FCS_STATE_WAKING. However,
++			// we would still need to migrate it. If we let the
++			// thread return to user-space before we migrate it, we
++			// migth end up doing so while the thread has a
++			// user-space lock held, which we want to avoid for
++			// perfomance. However, because it is an extremely
++			// unlikely event, we let it pass.
++
++			spin_unlock(&p->fcs.lock);
++
++			cpumaskp = (in_mask) ? in_mask : (cpumask_t *) cpumask_of(current_cpu);
++
++			// we need to change the wakee affinity
++			if (!cpumask_equal(cpumaskp, &p->cpus_mask)) {
++				ac = (struct affinity_context){
++					.new_mask  = cpumaskp,
++					.flags     = 0,
++				};
++
++				// we need to enable preemption again because
++				// __sched_setaffinity might trigger a call to
++				// schedule(), which will throw a "scheduling while
++				// atomic" bug
++				// TODO avoid enabling preemption
++				preempt_enable_no_resched();
++				if (likely((p->group_leader == current->group_leader) && (!in_mask))) {
++					// same as __sched_setaffinity but do no
++					// check cgroup permissions to skip
++					// locking for threads belonging to the
++					// same process that swap cpus
++					ret = fcs_sched_setaffinity(p, &ac);
++				} else {
++					// either we are swaping for a thread of
++					// another process or the user provided
++					// a custom cpu mask. We need to do
++					// cgroup checks.
++					ret = __sched_setaffinity(p, &ac);
++				}
++				if (unlikely(ret)) {
++					pr_err("fcs: %d: state=WAITING: __sched_setaffinity returned %d\n", current->pid, ret);
++					for_each_cpu(cpu, in_mask) {
++						pr_err("cpu %d\n", cpu);
++					}
++					pr_err("end cpuset dump\n");
++					return ret;
++				}
++				preempt_disable();
++			}
++
++			wake_up_process(p);
++		} else if (p->fcs.state == FCS_STATE_RUNNING) {
++			// The thread has not marked itself to be waiting yet.
++			//
++			// Because we don't know how long it will take for the
++			// thread to try to block itself, we pass it the
++			// affinity of the current thread and we ask it to
++			// migrate itself once it calls fcs.
++
++			p->fcs.state = FCS_STATE_NOWAIT;
++			if (unlikely(in_mask)) {
++				cpumask_copy(&p->fcs.cpumask, in_mask);
++				p->fcs.flags |= FCS_FLAGS_USERMASK;
++			} else {
++				p->fcs.cpumaskp = (cpumask_t *) cpumask_of(current_cpu);
++			}
++			if (unlikely((p->group_leader != current->group_leader) || in_mask)) {
++				p->fcs.flags |= FCS_FLAGS_CGROUP_CHECK;
++			}
++			spin_unlock(&p->fcs.lock);
++		} else {
++			spin_unlock(&p->fcs.lock);
++			preempt_enable();
++			pr_err("%d: fcs core: wake: INVAL\n", current->pid);
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
++
++static int fcs_wait(struct task_struct *p)
++{
++	int ret;
++	int cpu;
++	cpumask_t *cpumaskp;
++	cpumask_t cpumask;
++	struct restart_block *restart;
++	struct affinity_context ac;
++	char user_mask;
++	char need_cgroup_check;
++
++	// Block the current thread, if needed.
++	spin_lock(&current->fcs.lock);
++	if (current->fcs.state == FCS_STATE_NOWAIT) {
++		// Someone has woken us up already. Therefore the current thread
++		// doesn't need to block here, but it might need to migrate to
++		// another core.
++		need_cgroup_check = current->fcs.flags & FCS_FLAGS_CGROUP_CHECK;
++		user_mask = current->fcs.flags & FCS_FLAGS_USERMASK;
++		if (unlikely(user_mask)) {
++			cpumask_copy(&cpumask, &current->fcs.cpumask);
++			cpumaskp = &cpumask;
++		} else {
++			cpumaskp = current->fcs.cpumaskp;
++		}
++		current->fcs.cpumaskp = NULL;
++		current->fcs.flags = FCS_FLAGS_NONE;
++		current->fcs.state = FCS_STATE_RUNNING;
++
++		spin_unlock(&current->fcs.lock);
++		preempt_enable_no_resched();
++
++		if (!cpumask_equal(cpumaskp, &current->cpus_mask)) {
++			ac = (struct affinity_context){
++				.new_mask  = cpumaskp,
++				.flags     = 0,
++			};
++			if (unlikely(need_cgroup_check)) {
++				// the user passed a custom affinity mask, we
++				// need to check cgroups
++				ret = __sched_setaffinity(current, &ac);
++			} else {
++				// we are swapping a core with a thread that
++				// belongs to this process, no need to check
++				// cgroups affinity
++				ret = fcs_sched_setaffinity(current, &ac);
++			}
++			if (unlikely(ret)) {
++				pr_err("fcs: %d: state=NOWAIT: __sched_setaffinity returned %d\n", current->pid, ret);
++				for_each_cpu(cpu, cpumaskp) {
++					pr_err("cpu %d\n", cpu);
++				}
++				pr_err("end cpuset dump\n");
++				return ret;
++			}
++		}
++	} else if (current->fcs.state == FCS_STATE_RUNNING) {
++		// Nobody attempted to wake this thread yet. Therefore, it must
++		// block until someone wakes it up.
++
++		current->fcs.state = FCS_STATE_WAITING;
++		set_current_state(TASK_INTERRUPTIBLE);
++
++		// As soon as we go outside the lock, another thread might
++		// attempt to wake us up, even if we have not yet blocked.
++		// However, that's fine, because wake_up_process() (aka
++		// try_to_wake_up) will change our state to TASK_RUNNING, and
++		// calling schedule() below won't desquedule us. Schedule()
++		// might still do a context switch, but because it has not
++		// descheduled us, it will run us again at some point, we will
++		// loop, and the condition check will save the day.
++		//
++		// try_to_wake_up and schedule() need to synchronize to avoid
++		// missing a wake up (imagine a thread calling try_to_wake_up()
++		// on thread A before thread A reaches schedule()). They do so
++		// using p->__state, p->on_rq and rq_lock(). p->on_rq is 1 only
++		// if the thread is still on the run queue. p->__state is what
++		// we intentd to do. i.e. we want to put the thread to sleep, so
++		// we set the state to TASK_UNINTERRUPTIBLE and then we call
++		// schedule() to ask it to actually block it. If we call
++		// schedule while our state is TASK_RUNNING, schedule() won't
++		// remove us from the run queue, which means that the thread
++		// won't block.
++		//
++		// So, a thread A sets itself to TASK_UNINTERRUPTIBLE and then
++		// calls schedule(). In between setting __state and calling
++		// schedule(), another thread calls
++		// wake_up_process(). wake_up_process will take the run queue
++		// lock to serialize against schedule and will check on_rq to
++		// see if the thread is really blocked or not. Because it is
++		// still running on_rq is 1, and we now now that it has not yet
++		// calling schedule(). To avoid the thread from blocking,
++		// try_to_wake_up() sets __state to
++		// TASK_RUNNING, unlocks the run queue, and returns.
++		// When thread A calls schedule, it will take the runqueue lock.
++		// Then it will check __state and it will see that it is still
++		// TASK_RUNNING, so it won't remove it from the run queue.
++		// However, it might still perform a context switch if another
++		// thread needs to preempt us. However, because thread A is
++		// still on the run queue, it will be scheduled again at some
++		// point.
++
++		for (;;) {
++			if (current->fcs.state == FCS_STATE_WAKING)
++				break;
++
++			if (signal_pending(current)) {
++				ret = -ERESTARTSYS;
++				restart = &current->restart_block;
++				set_restart_fn(restart, fcs_restart);
++				break;
++			}
++
++			spin_unlock(&current->fcs.lock);
++			preempt_enable_no_resched();
++
++			schedule();
++
++			preempt_disable();
++			spin_lock(&current->fcs.lock);
++		}
++		__set_current_state(TASK_RUNNING);
++		current->fcs.state = FCS_STATE_RUNNING;
++		spin_unlock(&current->fcs.lock);
++		preempt_enable_no_resched();
++
++		// At this point, the current thread has been migrated by the
++		// waking thread (unless we are here because of a signal).
++	} else {
++		spin_unlock(&current->fcs.lock);
++		preempt_enable();
++		pr_err("%d: fcs core: wait: INVAL\n", current->pid);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int do_fcs(struct task_struct *p, cpumask_t *in_mask,
++		 char do_block)
++{
++	int ret;
++
++	// fcs_wake wakes up a thread. It also disables preemption.
++	ret = fcs_wake(p, in_mask);
++	if (ret)
++		return ret;
++
++	if (!do_block) {
++		preempt_enable();
++		return 0;
++	}
++
++	// fcs_wait blocks the current thread and reenables preepmtion.
++	ret = fcs_wait(p);
++
++	return ret;
++}
++
++static long fcs(pid_t pid, cpumask_t *in_mask, char do_block)
++{
++	int retval;
++	struct task_struct *p = NULL;
++
++	rcu_read_lock();
++
++	p = find_process_by_pid(pid);
++	if (!p) {
++		rcu_read_unlock();
++		return -ESRCH;
++	}
++
++	/* Prevent p going away */
++	get_task_struct(p);
++	rcu_read_unlock();
++
++	if (p->flags & PF_NO_SETAFFINITY) {
++		retval = -EINVAL;
++		goto out_put_task;
++	}
++
++	if (!check_same_owner(p)) {
++		rcu_read_lock();
++		if (!ns_capable(__task_cred(p)->user_ns, CAP_SYS_NICE)) {
++			rcu_read_unlock();
++			retval = -EPERM;
++			goto out_put_task;
++		}
++		rcu_read_unlock();
++	}
++
++	retval = security_task_setscheduler(p);
++	if (retval)
++		goto out_put_task;
++
++	retval = do_fcs(p, in_mask, do_block);
++
++out_put_task:
++	put_task_struct(p);
++
++	return retval;
++}
++
++#define FCS_NOBLOCK (1UL<<1)
++#define FCS_MASK FCS_NOBLOCK
++
++SYSCALL_DEFINE4(fcs, pid_t, pid, unsigned int, len, unsigned long __user *,
++		user_mask_ptr, unsigned long, flags)
++{
++	cpumask_var_t new_mask;
++	int retval;
++	char do_block = 1;
++
++	if (flags & ~FCS_MASK)
++		return -EINVAL;
++
++	if (flags & FCS_NOBLOCK)
++		do_block = 0;
++
++	if (user_mask_ptr != NULL) {
++		if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
++			return -ENOMEM;
++		retval = get_user_cpu_mask(user_mask_ptr, len, new_mask);
++		if (retval == 0)
++			retval = fcs(pid, new_mask, do_block);
++		free_cpumask_var(new_mask);
++	} else {
++		retval = fcs(pid, NULL, do_block);
++	}
++
++	return retval;
++}
++
+ void sched_show_task(struct task_struct *p)
+ {
+ 	unsigned long free = 0;
+diff --git kernel/sys_ni.c kernel/sys_ni.c
+index 9a846439b..ea83db2cc 100644
+--- kernel/sys_ni.c
++++ kernel/sys_ni.c
+@@ -193,6 +193,7 @@ COND_SYSCALL(migrate_pages);
+ COND_SYSCALL(move_pages);
+ COND_SYSCALL(set_mempolicy_home_node);
+ COND_SYSCALL(cachestat);
++COND_SYSCALL(fcs);
+ 
+ COND_SYSCALL(perf_event_open);
+ COND_SYSCALL(accept4);
