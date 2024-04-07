@@ -170,7 +170,7 @@ index 0000000..2b142d0
 +	[SDV3_EMACLITE]	= { 0x40011000000,	0x3000 },
 +	[SDV3_DMAETH]	= { 0x40011010000,	0x1000 },
 +	[SDV3_FLASH]	= { 0x800000000000,	0x200000 },
-+	[SDV3_DRAM]	= { 0x800000200000,	0x0 },
++	[SDV3_DRAM]	= { 0x800000400000,	0x0 },
 +};
 +
 +static void create_fdt_cpus(Sdv3State *st)
