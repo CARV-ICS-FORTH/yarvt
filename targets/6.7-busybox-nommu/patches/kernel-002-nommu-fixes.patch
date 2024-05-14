@@ -1,0 +1,101 @@
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index f6df30e8d..2e373d26a 100644
+--- arch/riscv/Kconfig
++++ arch/riscv/Kconfig
+@@ -62,7 +62,7 @@ config RISCV
+ 	select ARCH_WANTS_THP_SWAP if HAVE_ARCH_TRANSPARENT_HUGEPAGE
+ 	select BINFMT_FLAT_NO_DATA_START_OFFSET if !MMU
+ 	select BUILDTIME_TABLE_SORT if MMU
+-	select CLINT_TIMER if !MMU
++	select CLINT_TIMER if RISCV_M_MODE
+ 	select CLONE_BACKWARDS
+ 	select COMMON_CLK
+ 	select CPU_PM if CPU_IDLE || HIBERNATION
+@@ -199,8 +199,12 @@ config ARCH_MMAP_RND_COMPAT_BITS_MAX
+ 
+ # set if we run in machine mode, cleared if we run in supervisor mode
+ config RISCV_M_MODE
+-	bool
+-	default !MMU
++	bool "Build a kernel that runs in machine mode"
++	depends on !MMU
++	default y
++	help
++	  Select this option if you want to run the kernel in M-mode,
++	  without the assistance of any other firmware.
+ 
+ # set if we are running in S-mode and can use SBI calls
+ config RISCV_SBI
+@@ -215,10 +219,15 @@ config MMU
+ 	  Select if you want MMU-based virtualised addressing space
+ 	  support by paged memory management. If unsure, say 'Y'.
+ 
++config DRAM_BASE
++	hex '(S)DRAM Base Address' if !MMU
++	default 0x80000000
++
+ config PAGE_OFFSET
+ 	hex
+-	default 0xC0000000 if 32BIT && MMU
+-	default 0x80000000 if !MMU
++	default 0x80000000 if !MMU && RISCV_M_MODE
++	default DRAM_BASE if !MMU
++	default 0xc0000000 if 32BIT
+ 	default 0xff60000000000000 if 64BIT
+ 
+ config KASAN_SHADOW_OFFSET
+@@ -535,7 +544,6 @@ config TOOLCHAIN_HAS_ZBB
+ config RISCV_ISA_ZBB
+ 	bool "Zbb extension support for bit manipulation instructions"
+ 	depends on TOOLCHAIN_HAS_ZBB
+-	depends on MMU
+ 	depends on RISCV_ALTERNATIVE
+ 	default y
+ 	help
+@@ -567,7 +575,6 @@ config RISCV_ISA_ZICBOM
+ 
+ config RISCV_ISA_ZICBOZ
+ 	bool "Zicboz extension support for faster zeroing of memory"
+-	depends on MMU
+ 	depends on RISCV_ALTERNATIVE
+ 	default y
+ 	help
+diff --git a/arch/riscv/include/asm/page.h b/arch/riscv/include/asm/page.h
+index 57e887bfa..94b3d6930 100644
+--- arch/riscv/include/asm/page.h
++++ arch/riscv/include/asm/page.h
+@@ -89,7 +89,7 @@ typedef struct page *pgtable_t;
+ #define PTE_FMT "%08lx"
+ #endif
+ 
+-#ifdef CONFIG_64BIT
++#if defined(CONFIG_64BIT) && defined(CONFIG_MMU)
+ /*
+  * We override this value as its generic definition uses __pa too early in
+  * the boot process (before kernel_map.va_pa_offset is set).
+diff --git a/arch/riscv/include/asm/pgtable.h b/arch/riscv/include/asm/pgtable.h
+index a66845e31..80e852da2 100644
+--- arch/riscv/include/asm/pgtable.h
++++ arch/riscv/include/asm/pgtable.h
+@@ -904,7 +904,7 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)
+ #define PAGE_SHARED		__pgprot(0)
+ #define PAGE_KERNEL		__pgprot(0)
+ #define swapper_pg_dir		NULL
+-#define TASK_SIZE		0xffffffffUL
++#define TASK_SIZE		_AC(-1, UL)
+ #define VMALLOC_START		_AC(0, UL)
+ #define VMALLOC_END		TASK_SIZE
+ 
+diff --git a/arch/riscv/mm/init.c b/arch/riscv/mm/init.c
+index ee224fe18..699bd9681 100644
+--- arch/riscv/mm/init.c
++++ arch/riscv/mm/init.c
+@@ -232,7 +232,7 @@ static void __init setup_bootmem(void)
+ 	 * In 64-bit, any use of __va/__pa before this point is wrong as we
+ 	 * did not know the start of DRAM before.
+ 	 */
+-	if (IS_ENABLED(CONFIG_64BIT))
++	if (IS_ENABLED(CONFIG_64BIT) && IS_ENABLED(CONFIG_MMU))
+ 		kernel_map.va_pa_offset = PAGE_OFFSET - phys_ram_base;
+ 
+ 	/*
