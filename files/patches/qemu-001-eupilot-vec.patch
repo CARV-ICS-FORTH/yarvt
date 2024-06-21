@@ -1,8 +1,8 @@
-commit 9991e272fd14e18f919e71b21a6008f0644af11a
+commit bf61a811f84c0f9285a3a0d38e8c64331cb96531
 Author: Nick Kossifidis <mick@ics.forth.gr>
-Date:   Sun Mar 3 05:42:10 2024 +0200
+Date:   Sat Jun 22 00:13:17 2024 +0300
 
-    Add eupilot-vec machine
+    Add eupilot-vec machine, xxvnet_carv nic and a fix plic/emaclite
 
 diff --git a/configs/devices/riscv64-softmmu/default.mak b/configs/devices/riscv64-softmmu/default.mak
 index bc69301..e332fb0 100644
@@ -30,11 +30,1097 @@ index 5522ede..3df50e4 100644
      sifive_plic_set_pending(s, irq, level > 0);
      sifive_plic_update(s);
  }
+diff --git a/hw/net/Kconfig b/hw/net/Kconfig
+index 7fcc0d7..a289ae0 100644
+--- a/hw/net/Kconfig
++++ b/hw/net/Kconfig
+@@ -120,6 +120,10 @@ config COLDFIRE
+ config XILINX_ETHLITE
+     bool
+ 
++config XXVNET_CARV
++    bool
++    select PTIMER
++
+ config VIRTIO_NET
+     bool
+     default y
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index f64651c..26bb089 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -44,6 +44,7 @@ system_ss.add(when: 'CONFIG_ETRAXFS', if_true: files('etraxfs_eth.c'))
+ system_ss.add(when: 'CONFIG_COLDFIRE', if_true: files('mcf_fec.c'))
+ specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_llan.c'))
+ system_ss.add(when: 'CONFIG_XILINX_ETHLITE', if_true: files('xilinx_ethlite.c'))
++system_ss.add(when: 'CONFIG_XXVNET_CARV', if_true: files('xxvnet_carv.c'))
+ 
+ system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('net_rx_pkt.c'))
+ specific_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('virtio-net.c'))
+diff --git a/hw/net/xilinx_ethlite.c b/hw/net/xilinx_ethlite.c
+index 989afaf..a30efb6 100644
+--- a/hw/net/xilinx_ethlite.c
++++ b/hw/net/xilinx_ethlite.c
+@@ -30,6 +30,7 @@
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
+ #include "net/net.h"
++#include "qemu/log.h"
+ 
+ #define D(x)
+ #define R_TX_BUF0     0
+@@ -51,6 +52,7 @@
+ #define CTRL_I     0x8
+ #define CTRL_P     0x2
+ #define CTRL_S     0x1
++#define CTRL_RW_MASK (CTRL_I | CTRL_P | CTRL_S)
+ 
+ #define TYPE_XILINX_ETHLITE "xlnx.xps-ethernetlite"
+ DECLARE_INSTANCE_CHECKER(struct xlx_ethlite, XILINX_ETHLITE,
+@@ -67,8 +69,6 @@ struct xlx_ethlite
+ 
+     uint32_t c_tx_pingpong;
+     uint32_t c_rx_pingpong;
+-    unsigned int txbuf;
+-    unsigned int rxbuf;
+ 
+     uint32_t regs[R_MAX];
+ };
+@@ -91,11 +91,11 @@ eth_read(void *opaque, hwaddr addr, unsigned int size)
+ 
+     switch (addr)
+     {
++        case R_TX_CTRL1:
++        case R_TX_CTRL0:
+         case R_TX_GIE0:
+         case R_TX_LEN0:
+         case R_TX_LEN1:
+-        case R_TX_CTRL1:
+-        case R_TX_CTRL0:
+         case R_RX_CTRL1:
+         case R_RX_CTRL0:
+             r = s->regs[addr];
+@@ -122,34 +122,64 @@ eth_write(void *opaque, hwaddr addr,
+     {
+         case R_TX_CTRL0:
+         case R_TX_CTRL1:
+-            if (addr == R_TX_CTRL1)
+-                base = 0x800 / 4;
+ 
+             D(qemu_log("%s addr=" HWADDR_FMT_plx " val=%x\n",
+-                       __func__, addr * 4, value));
++                       __func__, addr, value));
++
++            if (addr == R_TX_CTRL1) {
++                base = R_TX_BUF1;
++                value &= ~CTRL_I;
++            } else
++                base = R_TX_BUF0;
++
++            value &= CTRL_RW_MASK;
++
++            /* User can only set S/P bits, not clear them */
++            value |= (s->regs[addr] & (CTRL_S | CTRL_P));
++
+             if ((value & (CTRL_P | CTRL_S)) == CTRL_S) {
+-                qemu_send_packet(qemu_get_queue(s->nic),
+-                                 (void *) &s->regs[base],
+-                                 s->regs[base + R_TX_LEN0]);
+-                D(qemu_log("eth_tx %d\n", s->regs[base + R_TX_LEN0]));
+-                if (s->regs[base + R_TX_CTRL0] & CTRL_I)
+-                    eth_pulse_irq(s);
++
++                if (!(s->regs[addr] & CTRL_S)) {
++                    qemu_send_packet(qemu_get_queue(s->nic),
++                                     (void *) &s->regs[base],
++                                     s->regs[base + R_TX_LEN0]);
++                    D(qemu_log("eth_tx %d\n", s->regs[base + R_TX_LEN0]));
++                    if (s->regs[R_TX_CTRL0] & CTRL_I)
++                        eth_pulse_irq(s);
++                }
++
+             } else if ((value & (CTRL_P | CTRL_S)) == (CTRL_P | CTRL_S)) {
+-                memcpy(&s->conf.macaddr.a[0], &s->regs[base], 6);
+-                if (s->regs[base + R_TX_CTRL0] & CTRL_I)
+-                    eth_pulse_irq(s);
++
++                if (!(s->regs[addr] & CTRL_P)) {
++                    memcpy(&s->conf.macaddr.a[0], &s->regs[base], 6);
++                    D(qemu_log("mac address set\n"));
++                    if (s->regs[R_TX_CTRL0] & CTRL_I)
++                        eth_pulse_irq(s);
++                }
+             }
+ 
+-            /* We are fast and get ready pretty much immediately so
+-               we actually never flip the S nor P bits to one.  */
+-            s->regs[addr] = value & ~(CTRL_P | CTRL_S);
++            /* TX / Programming done, clear S/P bits */
++            value &= ~(CTRL_S | CTRL_P);
++            s->regs[addr] = value;
++
+             break;
+ 
+         /* Keep these native.  */
+         case R_RX_CTRL0:
+         case R_RX_CTRL1:
+-            if (!(value & CTRL_S)) {
+-                qemu_flush_queued_packets(qemu_get_queue(s->nic));
++            value &= CTRL_RW_MASK;
++            if (addr == R_RX_CTRL1)
++                value &= ~CTRL_I;
++            /* User can only clear S bit, not set it */
++            if (s->regs[addr] & CTRL_S) {
++                if (!(value & CTRL_S)) {
++                    qemu_flush_queued_packets(qemu_get_queue(s->nic));
++                } else {
++                    value |= CTRL_S;
++                    /* Do we need to trigger an interrupt ? */
++                    if ((s->regs[R_RX_CTRL0] & CTRL_I) || value & CTRL_I)
++                        eth_pulse_irq(s);
++                }
+             }
+             /* fall through */
+         case R_TX_LEN0:
+@@ -179,47 +209,49 @@ static const MemoryRegionOps eth_ops = {
+ static bool eth_can_rx(NetClientState *nc)
+ {
+     struct xlx_ethlite *s = qemu_get_nic_opaque(nc);
+-    unsigned int rxbase = s->rxbuf * (0x800 / 4);
+ 
+-    return !(s->regs[rxbase + R_RX_CTRL0] & CTRL_S);
++    return !((s->regs[R_RX_CTRL0] & CTRL_S) &&
++             (s->c_rx_pingpong && s->regs[R_RX_CTRL1] & CTRL_S));
+ }
+ 
+ static ssize_t eth_rx(NetClientState *nc, const uint8_t *buf, size_t size)
+ {
+     struct xlx_ethlite *s = qemu_get_nic_opaque(nc);
+-    unsigned int rxbase = s->rxbuf * (0x800 / 4);
++    D(static int lost_count = 0;)
++
++    if (size > (R_RX_CTRL0 - R_RX_BUF0) * 4) {
++        D(qemu_log("ethlite packet is too big, size=%li\n", size));
++        return 0;
++    }
+ 
+     /* DA filter.  */
+     if (!(buf[0] & 0x80) && memcmp(&s->conf.macaddr.a[0], buf, 6))
+         return size;
+ 
+-    if (s->regs[rxbase + R_RX_CTRL0] & CTRL_S) {
+-        D(qemu_log("ethlite lost packet %x\n", s->regs[R_RX_CTRL0]));
+-        return -1;
+-    }
+-
+-    D(qemu_log("%s %zd rxbase=%x\n", __func__, size, rxbase));
+-    if (size > (R_MAX - R_RX_BUF0 - rxbase) * 4) {
+-        D(qemu_log("ethlite packet is too big, size=%x\n", size));
+-        return -1;
++    if (!(s->regs[R_RX_CTRL0] & CTRL_S)) {
++        memcpy(&s->regs[R_RX_BUF0], buf, size);
++        s->regs[R_RX_CTRL0] |= CTRL_S;
++    } else if (s->c_rx_pingpong && !(s->regs[R_RX_CTRL1] & CTRL_S)) {
++        memcpy(&s->regs[R_RX_BUF1], buf, size);
++        s->regs[R_RX_CTRL1] |= CTRL_S;
++    } else {
++        D(lost_count++;)
++        D(qemu_log("%s lost packet, size: %li, count: %i\n",
++                   __func__, size, lost_count));
++        return 0;
+     }
+-    memcpy(&s->regs[rxbase + R_RX_BUF0], buf, size);
+ 
+-    s->regs[rxbase + R_RX_CTRL0] |= CTRL_S;
++    D(qemu_log("%s got packet, size: %li\n", __func__, size));
+     if (s->regs[R_RX_CTRL0] & CTRL_I) {
+         eth_pulse_irq(s);
+     }
+ 
+-    /* If c_rx_pingpong was set flip buffers.  */
+-    s->rxbuf ^= s->c_rx_pingpong;
+     return size;
+ }
+ 
+ static void xilinx_ethlite_reset(DeviceState *dev)
+ {
+-    struct xlx_ethlite *s = XILINX_ETHLITE(dev);
+-
+-    s->rxbuf = 0;
++    return;
+ }
+ 
+ static NetClientInfo net_xilinx_ethlite_info = {
+diff --git a/hw/net/xxvnet_carv.c b/hw/net/xxvnet_carv.c
+new file mode 100644
+index 0000000..6fd25e9
+--- /dev/null
++++ b/hw/net/xxvnet_carv.c
+@@ -0,0 +1,858 @@
++/*
++ * QEMU model of the XXVNET CARV NIC (based on Xilinx AXI DMA).
++ *
++ * Copyright (c) 2024 Nick Kossifidis <mick@ics.forth.gr>
++ *		      CARV ICS/FORTH
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "sysemu/dma.h"
++#include "hw/sysbus.h"
++#include "hw/irq.h"
++#include "hw/ptimer.h"
++#include "hw/qdev-properties.h"
++#include "net/net.h"
++
++
++#define D(x)
++
++#define TYPE_XXVNET_CARV "xlnx.xxvnet_carv"
++DECLARE_INSTANCE_CHECKER(struct axidma_state, XXVNET_CARV,
++                         TYPE_XXVNET_CARV)
++/**************\
++* REGISTER MAP *
++\**************/
++
++/* Per-Channel registers */
++
++/* DMA Control Register */
++#define	AXIDMA_DMACR	0x00
++
++enum dmacr_fields {
++	DMACR_RS = 1,
++	DMACR_TAILPTR_MODE = 1 << 1,
++	DMACR_RESET = 1 << 2,
++	DMACR_KEYHOLE = 1 << 3,
++	DMACR_CYCLIC_BD = 1 << 4,
++	DMACR_RESERVED = 0x7F << 5,
++	DMACR_INTR_ON_COMPLETE = 1 << 12,
++	DMACR_INTR_ON_DELAY = 1 << 13,
++	DMACR_INTR_ON_ERROR = 1 << 14,
++	DMACR_RESERVED2 = 1 << 15,
++	DMACR_IRQ_THRESH = 0xFF << 16,
++	DMACR_IRQ_DELAY = 0XFF << 24
++};
++
++#define AXIDMA_DMACR_RW_MASK ~(DMACR_TAILPTR_MODE | \
++			       DMACR_KEYHOLE | \
++			       DMACR_RESERVED | \
++			       DMACR_RESERVED2);
++
++/* DMA Status Register */
++#define AXIDMA_DMASR	(0x04 / 4)
++
++/* DMA Status Register fields */
++enum dmasr_fields {
++	DMASR_HALTED = 1,
++	DMASR_IDLE = 1 << 1,
++	DMASR_SG_INCLUDED = 1 << 3,
++	DMASR_INTERNAL_ERROR = 1 << 4,
++	DMASR_SLAVE_ERROR = 1 << 5,
++	DMASR_DECODE_ERROR = 1 << 6,
++	DMASR_SG_INTERNAL_ERROR = 1 << 8,
++	DMASR_SG_SLAVE_ERROR = 1 << 9,
++	DMASR_SG_DECODE_ERROR = 1 << 10,
++	DMASR_INTR_ON_COMPLETE = 1 << 12,
++	DMASR_INTR_ON_DELAY = 1 << 13,
++	DMASR_INTR_ON_ERROR = 1 << 14,
++	DMASR_IRQ_THRESH = 0xFF << 16,
++	DMASR_IRQ_DELAY = 0xFF << 24
++};
++
++#define AXIDMA_DMASR_RW_MASK	(DMASR_INTR_ON_COMPLETE | \
++				 DMASR_INTR_ON_DELAY | \
++				 DMASR_INTR_ON_ERROR)
++
++#define AXIDMA_DMASR_ERR_MASK	(DMASR_INTERNAL_ERROR | \
++				 DMASR_SLAVE_ERROR | \
++				 DMASR_DECODE_ERROR | \
++				 DMASR_SG_INTERNAL_ERROR | \
++				 DMASR_SG_SLAVE_ERROR | \
++				 DMASR_SG_DECODE_ERROR)
++
++/* Current Descriptor Pointer (SG only) */
++#define AXIDMA_CURDESC		(0x08 / 4)
++#define AXIDMA_CURDESC_MSB	(0x0C / 4)
++
++/* Tail Descriptor Pointer (SG only) */
++#define AXIDMA_TAILDESC		(0x10 / 4)
++#define AXIDMA_TAILDESC_MSB	(0x14 / 4)
++
++/* Direct transfer buffer address (Direct only) */
++#define	AXIDMA_BUFFER_ADDR	(0x18 / 4)
++#define	AXIDMA_BUFFER_ADDR_MSB	(0x1c / 4)
++
++/* Direct transfer buffer length (bytes) (Direct only) */
++#define	AXIDMA_BUFFER_LENGTH	(0x28 / 4)
++
++/* Scatter/Gather User and Cache (SG / MM2S only) */
++#define AXIDMA_SG_CTL		(0x2C / 4)
++
++#define AXIDMA_CHAN_REG_MAX	(0x30 / 4)
++
++/* Note: same bits on DMASR/DMACR */
++#define AXIDMA_CHAN_INTR_MASK	(DMASR_INTR_ON_COMPLETE | \
++				 DMASR_INTR_ON_DELAY | \
++				 DMASR_INTR_ON_ERROR)
++
++#define XXVNET_MM2S_BASE	0x00
++#define XXVNET_S2MM_BASE	AXIDMA_CHAN_REG_MAX * 4
++
++#define MAX_PACKET_SIZE		4096
++
++/*******************\
++* DESCRIPTOR FORMAT *
++\*******************/
++
++#define APP_SPECIFIC_REGISTERS_NUM	5
++
++struct axidma_desc {
++	uint64_t next;
++	uint64_t buffer_addr;
++	uint64_t reserved;
++	uint32_t control;
++	uint32_t status;
++	uint32_t app[APP_SPECIFIC_REGISTERS_NUM];
++};
++
++enum desc_control_fields {
++	STR_CTL_LEN_MASK = (1 << 26) - 1,
++	STR_CTL_TXEOF = (1 << 26),
++	STR_CTL_TXSOF = (1 << 27),
++};
++
++enum desc_status_fields {
++	STR_STS_LEN_MASK = (1 << 26) - 1,
++	STR_STS_RXEOF = (1 << 26),
++	STR_STS_RXSOF = (1 << 27),
++	STR_STS_INTERNAL_ERROR = (1 << 28),
++	STR_STS_SLAVE_ERROR = (1 << 29),
++	STR_STS_DECODE_ERROR = (1 << 20),
++	STR_STS_COMPLETED = (1 << 31)
++};
++
++/***************\
++* CHANNEL STATE *
++\***************/
++
++struct axidma_channel {
++	uint32_t regs[AXIDMA_CHAN_REG_MAX];
++
++	int id;
++	qemu_irq irq;
++
++	/* For interrupt coalescing */
++	ptimer_state *delay_timer;
++	int ioc_counter;
++
++	/* Copy of current descriptor */
++	struct axidma_desc cur_desc_copy;
++
++	/* Stream buffer */
++	uint8_t	stream_buff[MAX_PACKET_SIZE];
++	uint16_t stream_buff_pos;
++
++	bool paused;
++};
++
++enum axidma_channel_id {
++	CHAN_MM2S = 0,
++	CHAN_S2MM = 1,
++};
++
++/**************\
++* DEVICE STATE *
++\**************/
++
++struct axidma_state {
++	SysBusDevice parent_obj;
++	MemoryRegion iomem;
++	AddressSpace addr_space;
++	uint32_t sg_clk_rate_hz;
++	NICState *nic;
++	NICConf conf;
++	struct axidma_channel mm2s;
++	struct axidma_channel s2mm;
++};
++
++
++/*********\
++* HELPERS *
++\*********/
++
++static inline bool axidma_chan_active(struct axidma_channel *chan)
++{
++	return (chan->regs[AXIDMA_DMACR] & DMACR_RS) ? true : false;
++}
++
++static void axidma_eval_intr_status(struct axidma_channel *chan)
++{
++	uint32_t pending = chan->regs[AXIDMA_DMASR] & AXIDMA_CHAN_INTR_MASK;
++	uint32_t enabled = chan->regs[AXIDMA_DMACR] & AXIDMA_CHAN_INTR_MASK;
++	if (pending & enabled) {
++		D(qemu_log("%s: got intr on chan %i, mask: 0x%x\n",__func__,
++			   chan->id, pending));
++		qemu_set_irq(chan->irq, true);
++	} else
++		qemu_set_irq(chan->irq, false);
++}
++
++static void axidma_dtimer_reset(struct axidma_channel *chan, bool run)
++{
++	uint8_t dmacr_irq_delay_field = ((chan->regs[AXIDMA_DMACR] >> 24) & 0xFF);
++	/* DMACR IRQ Delay field is in increments of 125 * sg clock period */
++	if (dmacr_irq_delay_field) {
++		ptimer_transaction_begin(chan->delay_timer);
++		ptimer_stop(chan->delay_timer);
++		ptimer_set_count(chan->delay_timer, dmacr_irq_delay_field * 125);
++		if (run)
++			ptimer_run(chan->delay_timer, 1);
++		ptimer_transaction_commit(chan->delay_timer);
++	}
++}
++
++static void axidma_trigger_error(struct axidma_channel *chan, uint32_t dmasr)
++{
++	D(qemu_log("%s: error on channel %i, dmasr: 0x%x\n",__func__, chan->id, dmasr));
++	chan->regs[AXIDMA_DMASR] |= dmasr | DMASR_HALTED | DMASR_INTR_ON_ERROR;
++	chan->regs[AXIDMA_DMACR] &= ~(DMACR_RS);
++	axidma_eval_intr_status(chan);
++}
++
++static void axidma_dtimer_trigger(void *arg)
++{
++	struct axidma_channel *chan = (struct axidma_channel *) arg;
++	if (chan->regs[AXIDMA_DMACR] & DMACR_RS) {
++		chan->regs[AXIDMA_DMASR] |= DMASR_INTR_ON_DELAY;
++		axidma_eval_intr_status(chan);
++	}
++}
++
++static void axidma_dtimer_init(struct axidma_state *state, struct axidma_channel *chan)
++{
++	chan->delay_timer = ptimer_init(axidma_dtimer_trigger, chan, PTIMER_POLICY_LEGACY);
++	ptimer_transaction_begin(chan->delay_timer);
++	ptimer_set_freq(chan->delay_timer, state->sg_clk_rate_hz);
++	ptimer_transaction_commit(chan->delay_timer);
++}
++
++static void axidma_ioc_update(struct axidma_channel *chan)
++{
++	unsigned int irq_thres = (chan->regs[AXIDMA_DMACR] & DMACR_IRQ_THRESH) >> 16;
++	chan->ioc_counter = irq_thres == 0 ? 1 : irq_thres;
++}
++
++static void axidma_transfer_complete(struct axidma_channel *chan)
++{
++	axidma_dtimer_reset(chan, true);
++
++	if (chan->ioc_counter > 0)
++		chan->ioc_counter--;
++
++	if (chan->ioc_counter == 0) {
++		chan->regs[AXIDMA_DMASR] |= DMASR_INTR_ON_COMPLETE;
++		chan->ioc_counter = ((chan->regs[AXIDMA_DMACR] >> 16) & 0xFF);
++		axidma_eval_intr_status(chan);
++	}
++
++	chan->stream_buff_pos = 0;
++}
++
++static void axidma_chan_reset(struct axidma_channel *chan)
++{
++	axidma_dtimer_reset(chan, false);
++	/* TAILPTR_MODE is alwasy 1, IRQ thres minimum is 1 */
++	chan->regs[AXIDMA_DMACR] = DMACR_TAILPTR_MODE | (1 << 16);
++	/* Start in halted state, no errors/intrs, and SG_INCLUDED hardcoded to 1 */
++	chan->regs[AXIDMA_DMASR] = DMASR_HALTED | DMASR_SG_INCLUDED;
++	chan->stream_buff_pos = 0;
++}
++
++static void axidma_reset(struct axidma_state *state)
++{
++	D(qemu_log("%s triggered\n", __func__));
++	axidma_chan_reset(&state->mm2s);
++	axidma_chan_reset(&state->s2mm);
++}
++
++static void axidma_init_state(struct axidma_state *state)
++{
++	axidma_reset(state);
++	state->mm2s.id = CHAN_MM2S;
++	state->s2mm.id = CHAN_S2MM;
++}
++
++static MemTxResult axidma_load_current_desc(struct axidma_state *state, struct axidma_channel *chan)
++{
++	struct axidma_desc *desc = &chan->cur_desc_copy;
++	hwaddr curdesc_ptr = le64_to_cpu(*((hwaddr *) (&chan->regs[AXIDMA_CURDESC])));
++
++	MemTxResult ret = address_space_read(&state->addr_space, curdesc_ptr,
++					     MEMTXATTRS_UNSPECIFIED, desc,
++					     sizeof (struct axidma_desc));
++	if (ret != MEMTX_OK)
++		return ret;
++
++	desc->next = le64_to_cpu(desc->next);
++	desc->buffer_addr = le64_to_cpu(desc->buffer_addr);
++	desc->control = le32_to_cpu(desc->control);
++	desc->status = le32_to_cpu(desc->status);
++
++	return MEMTX_OK;
++}
++
++static MemTxResult axidma_store_current_desc(struct axidma_state *state, struct axidma_channel *chan)
++{
++	struct axidma_desc *desc = &chan->cur_desc_copy;
++	hwaddr curdesc_ptr = le64_to_cpu(*((hwaddr *) (&chan->regs[AXIDMA_CURDESC])));
++	MemTxResult ret = MEMTX_OK;
++
++	desc->next = cpu_to_le64(desc->next);
++	desc->buffer_addr = cpu_to_le64(desc->buffer_addr);
++	desc->reserved = 0;
++	desc->control = cpu_to_le32(desc->control);
++	desc->status = cpu_to_le32(desc->status);
++
++	ret = address_space_write(&state->addr_space, curdesc_ptr,
++				  MEMTXATTRS_UNSPECIFIED, desc,
++				  sizeof (struct axidma_desc));
++	return ret;
++}
++
++/**********************\
++* TRANSMIT PATH (MM2S) *
++\**********************/
++
++static void axidma_mm2s_process(struct axidma_state *state)
++{
++	struct axidma_channel *chan = &state->mm2s;
++	bool eof = false;
++
++	D(qemu_log("%s tx engine start\n", __func__));
++
++	/* User may send us packets in fragments, or move tail descriptor
++	 * while processing, hence the loop. */
++	while(true) {
++		/* Load current descriptor */
++		MemTxResult ret = axidma_load_current_desc(state, chan);
++		if (ret != MEMTX_OK) {
++			if (ret == MEMTX_DECODE_ERROR)
++				axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++			else
++				axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++			break;
++		}
++
++		struct axidma_desc *desc = &chan->cur_desc_copy;
++		/* If we resume operation from IDLE, it means we've already processed
++		 * the current descriptor (which was our previous tail descriptor), clear
++		 * the IDLE bit and resume operation from the next descriptor. */
++		if (chan->regs[AXIDMA_DMASR] & DMASR_IDLE) {
++			chan->regs[AXIDMA_DMASR] &= ~DMASR_IDLE;
++			*((uint64_t*) &chan->regs[AXIDMA_CURDESC]) = cpu_to_le64(desc->next);
++			continue;
++		}
++
++		/* Reached a descriptor marked as completed, the other end
++		 * hasn't processed this descriptor yet, halt and wait for
++		 * the other end to catch up with us and resert. Ignore this
++		 * if cyclic BD mode is enabled. */
++		if (desc->status & STR_STS_COMPLETED &&
++		    !(chan->regs[AXIDMA_DMACR] & DMACR_CYCLIC_BD)) {
++			axidma_trigger_error(chan, DMASR_SG_INTERNAL_ERROR);
++			break;
++		}
++
++		/* Start of a new packet, seek to the begining of the buffer
++		 * (possibly throwing away any unfinished packet), reset
++		 * (and stop) delay timer, it'll start again on EOF. */
++		if (desc->control & STR_CTL_TXSOF) {
++			chan->stream_buff_pos = 0;
++			axidma_dtimer_reset(chan, false);
++			D(qemu_log("%s got sof\n", __func__));
++		}
++
++		/* Verify the length field, trigger internal error if zero,
++		 * and make sure we won't overflow the stream buffer. */
++		int buff_len = (desc->control & STR_CTL_LEN_MASK);
++		if (buff_len == 0) {
++			axidma_trigger_error(chan, DMASR_INTERNAL_ERROR);
++			desc->status |= STR_STS_INTERNAL_ERROR;
++			ret = axidma_store_current_desc(state, chan);
++			if (ret != MEMTX_OK) {
++				if (ret == MEMTX_DECODE_ERROR)
++					axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++				else
++					axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++			}
++			break;
++		}
++
++		if ((chan->stream_buff_pos + buff_len) > MAX_PACKET_SIZE) {
++			D(qemu_log("%s fragment len truncated: %i\n", __func__, buff_len));
++			buff_len = MAX_PACKET_SIZE - chan->stream_buff_pos;
++		}
++
++		/* Fill stream buffer */
++		if (buff_len > 0) {
++			hwaddr src = desc->buffer_addr;
++			uint8_t *dst = (chan->stream_buff + chan->stream_buff_pos);
++			D(qemu_log("%s got fragment, len: %i, addr: 0x" HWADDR_FMT_plx "\n",
++				   __func__, buff_len, src));
++			ret = address_space_read(&state->addr_space, src,
++						MEMTXATTRS_UNSPECIFIED,
++						dst, buff_len);
++			if (ret != MEMTX_OK) {
++				D(qemu_log("%s buffer read failed, addr: 0x" HWADDR_FMT_plx " ret: %i\n",
++					   __func__, src, ret));
++				if (ret == MEMTX_DECODE_ERROR) {
++					axidma_trigger_error(chan, DMASR_SG_DECODE_ERROR);
++					desc->status |= STR_STS_DECODE_ERROR;
++				} else {
++					axidma_trigger_error(chan, DMASR_SG_SLAVE_ERROR);
++					desc->status |= STR_STS_SLAVE_ERROR;
++				}
++				ret = axidma_store_current_desc(state, chan);
++				if (ret != MEMTX_OK) {
++					if (ret == MEMTX_DECODE_ERROR)
++						axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++					else
++						axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++				}
++				break;
++			}
++			chan->stream_buff_pos += buff_len;
++		}
++
++		/* Last fragment for this packet */
++		eof = (desc->control & STR_CTL_TXEOF);
++
++		/* Mark descriptor as completed, releasing it so that it can
++		 * be used by the other end. */
++		desc->status = buff_len | STR_STS_COMPLETED;
++		ret = axidma_store_current_desc(state, chan);
++		if (ret != MEMTX_OK) {
++			if (ret == MEMTX_DECODE_ERROR)
++				axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++			else
++				axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++			break;
++		}
++
++		/* Got a full packet, signal a completed transfer and route
++		 * packet through qemu */
++		if (eof) {
++			qemu_send_packet(qemu_get_queue(state->nic),
++					 (void *) chan->stream_buff,
++					 chan->stream_buff_pos);
++			D(qemu_log("%s packet sent: %i\n", __func__, chan->stream_buff_pos));
++			axidma_transfer_complete(chan);
++		}
++
++		/* Check if we reached the tail descriptor */
++		hwaddr curdesc_ptr = *((hwaddr *) (&chan->regs[AXIDMA_CURDESC]));
++		hwaddr taildesc_ptr = *((hwaddr *) (&chan->regs[AXIDMA_TAILDESC]));
++
++		if (curdesc_ptr == taildesc_ptr) {
++			chan->regs[AXIDMA_DMASR] |= DMASR_IDLE;
++			break;
++		}
++
++		/* Move on to the next descriptor */
++		/* Note: axidma_store_current_desc has already converted this to le64 */
++		*((uint64_t*) &chan->regs[AXIDMA_CURDESC]) = desc->next;
++	}
++	D(qemu_log("%s tx engine stop\n", __func__));
++}
++
++/*********************\
++* RECEIVE PATH (S2MM) *
++\*********************/
++
++static void axidma_s2mm_process(struct axidma_state *state, const uint8_t *inbuff, size_t inbuff_len)
++{
++	struct axidma_channel *chan = &state->s2mm;
++
++	if (!axidma_chan_active(chan))
++		return;
++
++	if (inbuff_len == 0)
++		return;
++
++	D(qemu_log("%s rx start: %li\n", __func__, inbuff_len));
++
++	/* Load current descriptor */
++ resume:
++	MemTxResult ret = axidma_load_current_desc(state, chan);
++	if (ret != MEMTX_OK) {
++		if (ret == MEMTX_DECODE_ERROR)
++			axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++		else
++			axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++		return;
++	}
++
++	struct axidma_desc *desc = &chan->cur_desc_copy;
++	/* If we resume operation from IDLE, it means we've already processed
++	 * the current descriptor (which was our previous tail descriptor), clear
++	 * the IDLE bit and resume operation from the next descriptor. */
++	if (chan->regs[AXIDMA_DMASR] & DMASR_IDLE) {
++		chan->regs[AXIDMA_DMASR] &= ~DMASR_IDLE;
++		*((uint64_t*) &chan->regs[AXIDMA_CURDESC]) = cpu_to_le64(desc->next);
++		goto resume;
++	}
++
++	/* Reached a descriptor marked as completed, the other end
++	 * hasn't released this descriptor yet, halt and wait for
++	 * the other end to catch up with us and resert. Ignore this
++	 * if cyclic BD mode is enabled. */
++	if (desc->status & STR_STS_COMPLETED &&
++	    !(chan->regs[AXIDMA_DMACR] & DMACR_CYCLIC_BD)) {
++		axidma_trigger_error(chan, DMASR_SG_INTERNAL_ERROR);
++		D(qemu_log("%s lost packet: %li\n", __func__, inbuff_len));
++		return;
++	}
++
++	/* Verify the length field, trigger internal error if zero,
++	 * and make sure we won't overflow the target buffer. In this case
++	 * the stream buffer is already full and we are about to drain it.*/
++	int buff_len = (desc->control & STR_CTL_LEN_MASK);
++	if (buff_len == 0) {
++		axidma_trigger_error(chan, DMASR_INTERNAL_ERROR);
++		desc->status |= STR_STS_INTERNAL_ERROR;
++		ret = axidma_store_current_desc(state, chan);
++		if (ret != MEMTX_OK) {
++			if (ret == MEMTX_DECODE_ERROR)
++				axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++			else
++				axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++		}
++		return;
++	}
++
++	/* Packet won't fit in target buffer, drop it */
++	if (inbuff_len > buff_len) {
++		D(qemu_log("%s received packet too big: %li > %i \n",
++		  __func__, inbuff_len, buff_len));
++		return;
++	}
++
++	hwaddr dst = desc->buffer_addr;
++	ret = address_space_write(&state->addr_space, dst,
++				MEMTXATTRS_UNSPECIFIED,
++				inbuff, inbuff_len);
++	if (ret != MEMTX_OK) {
++		if (ret == MEMTX_DECODE_ERROR) {
++			axidma_trigger_error(chan, DMASR_SG_DECODE_ERROR);
++			desc->status |= STR_STS_DECODE_ERROR;
++		} else {
++			axidma_trigger_error(chan, DMASR_SG_SLAVE_ERROR);
++			desc->status |= STR_STS_SLAVE_ERROR;
++		}
++		ret = axidma_store_current_desc(state, chan);
++		if (ret != MEMTX_OK) {
++			if (ret == MEMTX_DECODE_ERROR)
++				axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++			else
++				axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++		}
++		return;
++	}
++
++	desc->status = (inbuff_len & STR_STS_LEN_MASK) |
++			STR_STS_COMPLETED |
++			STR_STS_RXSOF |
++			STR_STS_RXEOF;
++
++	ret = axidma_store_current_desc(state, chan);
++	if (ret != MEMTX_OK) {
++		if (ret == MEMTX_DECODE_ERROR)
++			axidma_trigger_error(chan, DMASR_DECODE_ERROR);
++		else
++			axidma_trigger_error(chan, DMASR_SLAVE_ERROR);
++		return;
++	}
++
++	D(qemu_log("%s rx complete: %li\n", __func__, inbuff_len));
++	axidma_transfer_complete(chan);
++
++	/* Check if we reached the tail descriptor */
++	hwaddr curdesc_ptr = *((hwaddr *) (&chan->regs[AXIDMA_CURDESC]));
++	hwaddr taildesc_ptr = *((hwaddr *) (&chan->regs[AXIDMA_TAILDESC]));
++
++	if (curdesc_ptr == taildesc_ptr) {
++		chan->regs[AXIDMA_DMASR] |= DMASR_IDLE;
++		return;
++	}
++
++	/* Move on to the next descriptor */
++	/* Note: axidma_store_current_desc has already converted this to le64 */
++	*((uint64_t*) &chan->regs[AXIDMA_CURDESC]) = desc->next;
++}
++
++static bool xxvnet_can_rx(NetClientState *nc)
++{
++	struct axidma_state *state = qemu_get_nic_opaque(nc);
++	struct axidma_channel *chan = &state->s2mm;
++	return axidma_chan_active(chan);
++}
++
++static ssize_t xxvnet_rx(NetClientState *nc, const uint8_t *buf, size_t size)
++{
++	struct axidma_state *state = qemu_get_nic_opaque(nc);
++	struct axidma_channel *chan = &state->s2mm;
++	axidma_s2mm_process(state, buf, size);
++	/* If an error occured we failed to send the packet and the
++	 * engine has stopped, return 0 to stop rx queue. We'll restart
++	 * rx queue later on when we call qemu_flush_queued_packets(). */
++	if (chan->regs[AXIDMA_DMASR] & DMASR_HALTED)
++		return 0;
++	else
++		return size;
++}
++
++static NetClientInfo net_xxvnet_carv_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = xxvnet_can_rx,
++    .receive = xxvnet_rx,
++};
++
++/*************\
++* MMIO ACCESS *
++\*************/
++
++static uint64_t axidma_read(void *opaque, hwaddr addr, unsigned int size)
++{
++	struct axidma_state *state = (struct axidma_state *) opaque;
++	struct axidma_channel *chan = (addr >= XXVNET_S2MM_BASE) ?
++				      &state->s2mm : &state->mm2s;
++	uint64_t val = 0;
++	/* Turn address to an index in regs array */
++	hwaddr reg_offt = addr >> 2;
++	reg_offt %= AXIDMA_CHAN_REG_MAX;
++
++	switch (reg_offt) {
++		case AXIDMA_DMACR:
++			/* run/stop bit set by user, cleared by axidma_trigger_error() */
++			/* reset bit set by user, cleared by axidma_chan_reset() */
++			/* TAILPTR should always be 1, set during init */
++			/* in our case DRE is enabled so keyhole is always 0 */
++			/* cyclic bd maintained by user */
++			/* INTR_ON_* bits maintained by user */
++			/* IRQ_* fields maintained by user */
++			val = chan->regs[reg_offt];
++			break;
++		case AXIDMA_DMASR:
++			/* all fields maintained by engine code above,
++			 * except DMASR_SG_INCLUDED and IRQ_* fields that we'll
++			 * update here. */
++			chan->regs[reg_offt] &= 0xffff;
++			chan->regs[reg_offt] |= (chan->ioc_counter & 0xff) << 16;
++			chan->regs[reg_offt] |= (ptimer_get_count(chan->delay_timer) & 0xff) << 24;
++			val = chan->regs[reg_offt] | DMASR_SG_INCLUDED;;
++			break;
++		/* Unused registers */
++		case AXIDMA_BUFFER_ADDR:
++		case AXIDMA_BUFFER_ADDR_MSB:
++		case AXIDMA_BUFFER_LENGTH:
++		case AXIDMA_SG_CTL:
++			val = 0;
++			break;
++		default:
++			val = chan->regs[reg_offt];
++			break;
++	}
++	D(qemu_log("%s chan %i addr: " HWADDR_FMT_plx " val: %lx\n",
++		   __func__, chan->id, reg_offt * 4, val));
++	return val;
++}
++
++static void axidma_write(void *opaque, hwaddr addr, uint64_t val,
++			 unsigned int size)
++{
++	struct axidma_state *state = (struct axidma_state *) opaque;
++	struct axidma_channel *chan = (addr >= XXVNET_S2MM_BASE) ?
++				      &state->s2mm : &state->mm2s;
++
++	/* Turn address to an index in regs array */
++	hwaddr reg_offt = addr >> 2;
++	reg_offt %= AXIDMA_CHAN_REG_MAX;
++
++	D(qemu_log("%s chan %i addr: " HWADDR_FMT_plx " val: %lx\n",
++		   __func__, chan->id, reg_offt * 4, val));
++
++	switch (reg_offt) {
++		case AXIDMA_DMACR:
++			/* Ignore reserved/unsupported/hardcoded fields */
++			val &= AXIDMA_DMACR_RW_MASK;
++
++			/* cyclic_bd may only be set when channel is inactive */
++			if ((chan->regs[AXIDMA_DMACR] & DMACR_RS) && val & DMACR_CYCLIC_BD)
++				val &= ~DMACR_CYCLIC_BD;
++
++			/* User can only set reset bit, not clear it */
++			val |= (chan->regs[AXIDMA_DMACR] & DMACR_RESET);
++
++			chan->regs[AXIDMA_DMACR] = val;
++
++			/* The reset bit triggers a reset for the whole engine */
++			if (val & DMACR_RESET)
++				axidma_reset(state);
++
++			axidma_ioc_update(chan);
++			axidma_dtimer_reset(chan, false);
++
++			/* R/S bit set and engine is not resetting, resume operation */
++			if ((val & DMACR_RS) && !(chan->regs[AXIDMA_DMACR] & DMACR_RESET)) {
++				chan->regs[AXIDMA_DMASR] &= ~(DMASR_HALTED);
++				chan->regs[AXIDMA_DMASR] &= ~(AXIDMA_DMASR_ERR_MASK);
++				/* halted -> paused */
++				chan->paused = true;
++			}
++
++			/* running -> paused */
++			if (!(val & DMACR_RS))
++				chan->paused = true;
++
++			break;
++		case AXIDMA_DMASR:
++			/* User can only write 1 to interrupt bits to disable them */
++			val &= ~(val & AXIDMA_DMASR_RW_MASK);
++			chan->regs[AXIDMA_DMASR] = val;
++			break;
++		case AXIDMA_CURDESC:
++		case AXIDMA_CURDESC_MSB:
++			/* If engine is running curdesc is RO */
++			if (chan->regs[AXIDMA_DMACR] & DMACR_RS)
++				break;
++			else
++				chan->regs[reg_offt] = val;
++			break;
++		case AXIDMA_TAILDESC_MSB:
++			chan->regs[reg_offt] = val;
++			/* If the channel is in paused state (waits for the first write
++			 * to taildesc) or IDLE (reached the taildesc), trigger processing. */
++			if ((chan->regs[AXIDMA_DMASR] & DMASR_IDLE) || chan->paused) {
++				if (chan->id == CHAN_MM2S)
++					axidma_mm2s_process(state);
++				else
++					qemu_flush_queued_packets(qemu_get_queue(state->nic));
++				chan->paused = false;
++			}
++			break;
++		/* Unused registers */
++		case AXIDMA_BUFFER_ADDR:
++		case AXIDMA_BUFFER_ADDR_MSB:
++		case AXIDMA_BUFFER_LENGTH:
++		case AXIDMA_SG_CTL:
++			break;
++		default:
++			chan->regs[reg_offt] = val;
++			break;
++	}
++
++	/* User may have updated irq enable/pending bits, re-evalutate intr status */
++	if ((reg_offt == AXIDMA_DMACR) || (reg_offt == AXIDMA_DMASR))
++		axidma_eval_intr_status(chan);
++}
++
++static const MemoryRegionOps axidma_ops = {
++	.read = axidma_read,
++	.write = axidma_write,
++	.endianness = DEVICE_NATIVE_ENDIAN,
++};
++
++/*****************\
++* INIT / REGISTER *
++\*****************/
++
++static void xxvnet_carv_realize(DeviceState *dev, Error **errp)
++{
++	struct axidma_state *state = XXVNET_CARV(dev);
++
++	address_space_init(&state->addr_space, get_system_memory(), "dma");
++
++	qemu_macaddr_default_if_unset(&state->conf.macaddr);
++	state->nic = qemu_new_nic(&net_xxvnet_carv_info, &state->conf,
++				 object_get_typename(OBJECT(dev)), dev->id,
++				 &dev->mem_reentrancy_guard, state);
++	qemu_format_nic_info_str(qemu_get_queue(state->nic), state->conf.macaddr.a);
++}
++
++static void xxvnet_carv_reset(DeviceState *dev)
++{
++	return;
++}
++
++static Property axidma_properties[] = {
++	DEFINE_PROP_UINT32("sg_clk_rate_hz", struct axidma_state, sg_clk_rate_hz, 50000000),
++	DEFINE_NIC_PROPERTIES(struct axidma_state, conf),
++ 	DEFINE_PROP_END_OF_LIST(),
++};
++
++static void xxvnet_carv_init(Object *obj)
++{
++	struct axidma_state *state = XXVNET_CARV(obj);
++
++	axidma_dtimer_init(state, &state->mm2s);
++	axidma_dtimer_init(state, &state->s2mm);
++	axidma_init_state(state);
++	memory_region_init_io(&state->iomem, obj, &axidma_ops, state,
++			      TYPE_XXVNET_CARV, (AXIDMA_CHAN_REG_MAX * 4) * 2);
++	sysbus_init_mmio(SYS_BUS_DEVICE(obj), &state->iomem);
++	sysbus_init_irq(SYS_BUS_DEVICE(obj), &state->mm2s.irq);
++	sysbus_init_irq(SYS_BUS_DEVICE(obj), &state->s2mm.irq);
++}
++
++static void xxvnet_carv_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = xxvnet_carv_realize;
++    dc->reset = xxvnet_carv_reset;
++    device_class_set_props(dc, axidma_properties);
++}
++
++static const TypeInfo xxvnet_carv_info = {
++    .name          = TYPE_XXVNET_CARV,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(struct axidma_state),
++    .instance_init = xxvnet_carv_init,
++    .class_init    = xxvnet_carv_class_init,
++};
++
++static void xxvnet_carv_register_types(void)
++{
++    type_register_static(&xxvnet_carv_info);
++}
++
++type_init(xxvnet_carv_register_types)
+\ No newline at end of file
 diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
-index b6a5eb4..046205a 100644
+index b6a5eb4..7a8caf0 100644
 --- a/hw/riscv/Kconfig
 +++ b/hw/riscv/Kconfig
-@@ -46,6 +46,14 @@ config RISCV_VIRT
+@@ -46,6 +46,15 @@ config RISCV_VIRT
      select PLATFORM_BUS
      select ACPI
  
@@ -45,6 +1131,7 @@ index b6a5eb4..046205a 100644
 +    select RISCV_ACLINT
 +    select SIFIVE_PLIC
 +    select XILINX_ETHLITE
++    select XXVNET_CARV
 +
  config SHAKTI_C
      bool
@@ -63,10 +1150,10 @@ index 2f7ee81..ce032bd 100644
  riscv_ss.add(when: 'CONFIG_SIFIVE_U', if_true: files('sifive_u.c'))
 diff --git a/hw/riscv/sdv3.c b/hw/riscv/sdv3.c
 new file mode 100644
-index 0000000..2b142d0
+index 0000000..5c41814
 --- /dev/null
 +++ b/hw/riscv/sdv3.c
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,681 @@
 +/*
 + * QEMU SDV3 board
 + *
@@ -403,6 +1490,41 @@ index 0000000..2b142d0
 +	g_free(emaclite_name);
 +}
 +
++static void create_fdt_ethdma(Sdv3State *st)
++{
++	MachineState *ms = MACHINE(st);
++	uint64_t xxvnet_addr = sdv3_memmap[SDV3_DMAETH].base;
++	uint64_t xxvnet_size = sdv3_memmap[SDV3_DMAETH].size;
++	static const char *interrupt_names[2] = {"mm2s_introut", "s2mm_introut"};
++	char *xxvnet_name;
++	int hart_count = st->cpus.num_harts;
++	uint32_t plic_phandle = hart_count + 1;
++	uint32_t ethdma_phandle = plic_phandle + 1;
++
++	xxvnet_name = g_strdup_printf("/soc/ethdma@%" PRIx64, xxvnet_addr);
++	qemu_fdt_add_subnode(ms->fdt, xxvnet_name);
++	qemu_fdt_setprop_string(ms->fdt, xxvnet_name, "compatible", "xlnx,xxv-ethernet-1.0-carv");
++	qemu_fdt_setprop_cells(ms->fdt, xxvnet_name, "reg", xxvnet_addr >> 32, xxvnet_addr,
++				xxvnet_size >> 32, xxvnet_size);
++	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "interrupt-parent", plic_phandle);
++	qemu_fdt_setprop_string_array(ms->fdt, xxvnet_name, "interrupt-names",
++				      (char **)&interrupt_names, ARRAY_SIZE(interrupt_names));
++	qemu_fdt_setprop_cells(ms->fdt, xxvnet_name, "interrupts", SDV3_DMAETH_TX_IRQ, SDV3_DMAETH_RX_IRQ);
++
++	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "xlnx,rxmem", 4096);
++	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "carv,mtu", 1500);
++	qemu_fdt_setprop(ms->fdt, xxvnet_name, "xlnx,include-dre", NULL, 0);
++
++	/* TODO: Clean up this mess on the driver side ! */
++	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "phandle", ethdma_phandle);
++	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "axistream-connected", ethdma_phandle);
++
++	/* Create /aliases/ethernet0 */
++	qemu_fdt_setprop_string(ms->fdt, "/aliases", "ethernet1", xxvnet_name);
++
++	g_free(xxvnet_name);
++}
++
 +static void create_fdt_test(Sdv3State *st)
 +{
 +	MachineState *ms = MACHINE(st);
@@ -410,12 +1532,12 @@ index 0000000..2b142d0
 +	uint64_t test_size = sdv3_memmap[SDV3_TEST].size;
 +	char *name;
 +	int hart_count = st->cpus.num_harts;
-+	uint32_t test_phandle = hart_count + 2;	/* PLIC's phandle + 1 */
++	uint32_t test_phandle = hart_count + 3;	/* PLIC's phandle + 2 */
 +
 +	name = g_strdup_printf("/soc/test@%" PRIx64, test_addr);
 +	qemu_fdt_add_subnode(ms->fdt, name);
 +	{
-+		static const char * const compat[3] = {
++		static const char *compat[3] = {
 +			"sifive,test1", "sifive,test0", "syscon"
 +		};
 +		qemu_fdt_setprop_string_array(ms->fdt, name, "compatible",
@@ -492,6 +1614,9 @@ index 0000000..2b142d0
 +	/* Populate /soc/emaclite, also creates /aliases/ethernet0 */
 +	create_fdt_emaclite(st);
 +
++	/* Populate /soc/ethdma, also creates /aliases/ethernet1 */
++	create_fdt_ethdma(st);
++
 +	/* Populate /soc/test, /reboot, /poweroff */
 +	create_fdt_test(st);
 +
@@ -556,7 +1681,8 @@ index 0000000..2b142d0
 +	Sdv3State *st = SDV3_MACHINE(machine);
 +	MemoryRegion *system_memory = get_system_memory();
 +	MemoryRegion *mask_rom = g_new(MemoryRegion, 1);
-+	NICInfo *nd = &nd_table[0];
++	NICInfo *nic0 = &nd_table[0];
++	NICInfo *nic1 = &nd_table[1];
 +	DeviceState *dev;
 +	int base_hartid = 0;
 +	int hart_count = machine->smp.cpus;
@@ -602,18 +1728,30 @@ index 0000000..2b142d0
 +			serial_hd(0), DEVICE_LITTLE_ENDIAN);
 +
 +	/* Register emaclite */
-+	qemu_check_nic_model(nd, "xlnx.xps-ethernetlite");
++	qemu_check_nic_model(nic0, "xlnx.xps-ethernetlite");
 +	dev = qdev_new("xlnx.xps-ethernetlite");
-+	qdev_set_nic_properties(dev, nd);
++	qdev_set_nic_properties(dev, nic0);
 +	qdev_prop_set_uint32(dev, "tx-ping-pong", 1);
 +	qdev_prop_set_uint32(dev, "rx-ping-pong", 1);
 +	sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-+	//sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, sdv3_memmap[SDV3_EMACLITE].base);
 +	sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
 +			   qdev_get_gpio_in(st->plic, SDV3_EMACLITE_IRQ));	
 +	mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
 +	memory_region_add_subregion(system_memory, sdv3_memmap[SDV3_EMACLITE].base, mr);
 +	error_report("emaclite at 0x%016lx\n", mr->addr);
++
++	/* Register ethdma */
++	qemu_check_nic_model(nic1, "xlnx.xxvnet_carv");
++	dev = qdev_new("xlnx.xxvnet_carv");
++	qdev_set_nic_properties(dev, nic1);
++	sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
++	sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
++			   qdev_get_gpio_in(st->plic, SDV3_DMAETH_TX_IRQ));
++	sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
++			   qdev_get_gpio_in(st->plic, SDV3_DMAETH_RX_IRQ));
++	mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
++	memory_region_add_subregion(system_memory, sdv3_memmap[SDV3_DMAETH].base, mr);
++	error_report("dmaeth at 0x%016lx\n", mr->addr);
 +
 +	/* Register pflash */
 +	pflash_cfi01_legacy_drive(st->pflash, drive_get(IF_PFLASH, 0, 0));

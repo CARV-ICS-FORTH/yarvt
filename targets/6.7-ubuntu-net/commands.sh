@@ -4,7 +4,7 @@ function target_usage () {
 	pr_inf "\nTARGET: ${1}"
 	pr_inf "\n${1} commands:"
 	pr_inf "\thelp/usage: Print this message"
-	pr_inf "\tbootstrap: (Re)Build unified image (osbi + Linux + rootfs)"
+	pr_inf "\tbootstrap: (Re)Build unified image (osbi + Linux)"
 	pr_inf "\trun_on_qemu: Test unified image on QEMU"
 	pr_wrn "\t<arg> Rootfs path on host's NFS server"
 }
@@ -69,17 +69,9 @@ function run_on_qemu () {
 		exit ${E_INVAL};
 	fi
 
-# Use virt machine for now until I debug this further
-#
-#	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,id=hnet0,smb=/home/$(whoami)  \
-#		-kernel ${LINUX_INSTALL_DIR}/Image \
-#		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot-vec:eth0:dhcp:: ro"
-
-	${QEMU} -nographic -machine virt -cpu rv64,v=true,vext_spec=v1.0,vlen=128 -smp 4 -m 2G -nic user,id=hnet0,smb=/home/$(whoami)  \
-		-device virtio-net-device,netdev=eth0 -netdev user,id=eth0 \
+	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,id=hnet0,smb=/home/$(whoami)  \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
 		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot-vec:eth0:dhcp:: ro"
-
 
 	cd ${SAVED_PWD}
 }
