@@ -20,6 +20,7 @@ if [[ ${DEBUG} == 1 ]]; then
 else
 	KEEP_LOGS=0
 fi
+: ${NOMMU_BUILD:=0}
 BASE_ISA=RV64I
 OSBI_WITH_PAYLOAD=0
 OSBI_PLATFORM=""
@@ -68,8 +69,10 @@ DBEAR_GITBRANCH="DROPBEAR_2022.83"
 IPERF3_GITURL=https://github.com/esnet/iperf.git
 IPERF3_GITBRANCH="3.16"
 
-RVGTOOLCHAIN_GITURL=https://github.com/riscv-collab/riscv-gnu-toolchain.git
-RVGTOOLCHAIN_GITBRANCH="2024.02.02"
+#RVGTOOLCHAIN_GITURL=https://github.com/riscv-collab/riscv-gnu-toolchain.git
+#RVGTOOLCHAIN_GITBRANCH="2024.02.02"
+RVGTOOLCHAIN_GITURL=https://github.com/CARV-ICS-FORTH/riscv-gnu-toolchain.git
+RVGTOOLCHAIN_GITBRANCH="uclibc"
 RVGTOOLCHAIN_GITCOMMIT=""
 RVGTOOLCHAIN_RELURL=https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/
 
@@ -306,7 +309,7 @@ function usage () {
 	pr_inf "\tbootstrap: (Re)Build toolchains and qemu"
 	pr_inf "\tbootstrap_fast: (Re)Fetch toolchains and rebuild qemu"
 	pr_inf "\tbuild_toolchain: (Re)Build a specific toolchain"
-	pr_wrn "\t<arg>: Toolchain type (newlib, glibc, musl32, musl64)"
+	pr_wrn "\t<arg>: Toolchain type (newlib, glibc, musl32, musl64, uclibc32, uclibc64)"
 	pr_inf "\tbuild_qemu: (Re)Build RISC-V QEMU"
 	list_targets
 	pr_inf "\nUseful variables:"
@@ -403,6 +406,10 @@ function get_tc_tuple() {
 		TUPLE="unknown-elf"
 	fi
 
+	if [[ ${TC_TYPE} == "uclibc" ]]; then
+		TUPLE="unknown-linux-uclibc"
+	fi
+
 	# Use multilib newlib/glibc if available
 	if [[ -d ${BINDIR}/riscv-${TC_TYPE}-toolchain ]]; then
 		echo "riscv64-${TUPLE}"
@@ -457,12 +464,18 @@ function build_busybox () {
 		MABI=ilp32d
 	fi
 
-	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 	EXTRA_CFLAGS="-Os -march=${MARCH} -mabi=${MABI} -mcmodel=medany -flto=$(nproc) -ffat-lto-objects"
+
+	if [[ ${NOMMU_BUILD} == 1 ]]; then
+		TC_INSTALL_DIR=$(get_tc_path uclibc ${BASE_ISA_XLEN})
+		TARGET_TUPLE=$(get_tc_tuple uclibc ${BASE_ISA_XLEN})-
+	fi
 
 	if [[ ! -d "${TC_INSTALL_DIR}" ]]; then
 		die "Toolchain not present, did you run bootstrap ?" ${E_NOTC}
 	fi
+
+	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
 	pr_inf "Checking out BusyBox sources..."
 	get_git_sources ${BBOX_GITBRANCH}
@@ -471,20 +484,31 @@ function build_busybox () {
 	cd "${SOURCES_DIR}"
 	make clean &>> ${LOGFILE}
 	make distclean &>> ${LOGFILE}
-	cat "${SCRIPT_PATH}"/files/busybox | \
+	if [[ ${NOMMU_BUILD} == 1 ]]; then
+		cp "${SCRIPT_PATH}"/files/busybox.nommu ./.config.tmp
+	else
+		cp "${SCRIPT_PATH}"/files/busybox ./.config.tmp
+	fi
+
+	cat ./.config.tmp | \
 	    sed s#"INSTALL_DIR"#"${INSTALL_DIR}"#g | \
 	    sed s#"TARGET_TUPLE"#"${TARGET_TUPLE}"#g | \
 	    sed s#"CONFIG_EXTRA_CFLAGS=\"\""#"CONFIG_EXTRA_CFLAGS=\"${EXTRA_CFLAGS}\""#g > .config
+
 	# Busybox's Makefile doesn't pass CFLAGS on its LD command,
 	# needed when using a multilib toolchain, else march/mabi are not preserved
 	sed -i "s#-nostdlib#-nostdlib ${EXTRA_CFLAGS}#" Makefile
 
 	pr_inf "Building BusyBox..."
-	make ARCH=riscv olddefconfig &>> ${LOGFILE}
+	make ARCH=riscv oldconfig &>> ${LOGFILE}
 	make ARCH=riscv -j${NUM_JOBS} &>> ${LOGFILE}
 	make install &>> ${LOGFILE}
 	if [[ ! -f "${INSTALL_DIR}"/bin/busybox ]]; then
 		die "\tBuild failed, check out ${LOGFILE}" ${E_BUILD}
+	fi
+
+	if [[ ${NOMMU_BUILD} == 1 ]]; then
+		cp -L $(${TARGET_TUPLE}gcc -print-sysroot)/usr/lib/ld-uClibc.so.0 ${INSTALL_DIR}/lib/
 	fi
 
 	cd "${SAVED_PWD}"
@@ -647,11 +671,12 @@ function build_toolchain () {
 	local SAVED_CLEAR_SOURCES=${CLEAR_SOURCES}
 
 	if [[ ${TC_TYPE} != "newlib" && ${TC_TYPE} != "glibc" &&
-	      ${TC_TYPE} != "musl32" && ${TC_TYPE} != "musl64" ]]; then
+	      ${TC_TYPE} != "musl32" && ${TC_TYPE} != "musl64" &&
+	      ${TC_TYPE} != "uclibc32" && ${TC_TYPE} != "uclibc64" ]]; then
 		die "Invalid toolchain type selected, aborting..." ${E_INVAL}
 	fi
 
-	if [[ ${TC_TYPE} == "musl32" ]]; then
+	if [[ ${TC_TYPE} == "musl32" || ${TC_TYPE} == "uclibc32" ]]; then
 		BASE_ISA_XLEN=32
 	fi
 
@@ -683,6 +708,10 @@ function build_toolchain () {
 	if [[ ${TC_TYPE} == "musl64" || ${TC_TYPE} == "musl32" ]]; then
 		get_git_submodule musl
 	fi
+
+	if [[ ${TC_TYPE} == "uclibc64" || ${TC_TYPE} == "uclibc32" ]]; then
+		get_git_submodule uclibc
+	fi
 	CLEAR_SOURCES=${SAVED_CLEAR_SOURCES}
 	GIT_CLONE_RECURSIVE=1
 
@@ -707,6 +736,8 @@ function build_toolchain () {
 		TC_MKTARGET="linux"
 	elif [[ ${TC_TYPE} == "musl32" || ${TC_TYPE} == "musl64" ]]; then
 		TC_MKTARGET="musl"
+	elif [[ ${TC_TYPE} == "uclibc32" || ${TC_TYPE} == "uclibc64" ]]; then
+		TC_MKTARGET="uclibc"
 	else
 		TC_MKTARGET=${TC_TYPE}
 	fi
@@ -1034,7 +1065,7 @@ function build_rootfs () {
 
 	build_busybox
 
-	if [[ "${NO_NETWORK}" == 0 ]]; then
+	if [[ ${NO_NETWORK} == 0 && ${NOMMU_BUILD} == 0 ]]; then
 		build_dropbear
 		build_iperf
 	fi
@@ -1075,6 +1106,8 @@ function bootstrap () {
 		build_toolchain glibc
 		#build_toolchain musl32
 		build_toolchain musl64
+		build_toolchain uclibc32
+		build_toolchain uclibc64
 		build_qemu
 	fi
 }
@@ -1096,6 +1129,8 @@ function setup_env () {
 	ALL_TC_PATHS+=("$(get_tc_path glibc 64)/bin")
 	ALL_TC_PATHS+=("$(get_tc_path musl 32)/bin")
 	ALL_TC_PATHS+=("$(get_tc_path musl 64)/bin")
+	ALL_TC_PATHS+=("$(get_tc_path uclibc 32)/bin")
+	ALL_TC_PATHS+=("$(get_tc_path uclibc 64)/bin")
 	local TC_PATHS_CLEANED=($(echo "${ALL_TC_PATHS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ':'))
 	local QEMU_PATH=${BINDIR}/riscv-qemu/bin
 	export PATH=${TC_PATHS_CLEANED[@]}${QEMU_PATH}:${PATH}
