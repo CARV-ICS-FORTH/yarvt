@@ -69,9 +69,14 @@ function run_on_qemu () {
 		exit ${E_INVAL};
 	fi
 
-	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,id=hnet0,smb=/home/$(whoami)  \
+	# Note: due to QEMU's networking code, where it is not possible to skip a nic and configure the next one, and the fact
+	# there is no null backend, we use the user backend for eth0, even though we won't use eth0 from the linux side.
+	# The reason is emaclite is too slow (and has significant packet loss) to run Linux with rootfs over NFS relialbly, dma
+	# based ethernet on the other hand is much better.
+	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 4G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
+		-nic user,id=hnet1,smb=/home/$(whoami) \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
-		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot-vec:eth0:dhcp:: ro"
+		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot-vec:eth1:dhcp:: ro"
 
 	cd ${SAVED_PWD}
 }

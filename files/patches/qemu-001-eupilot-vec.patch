@@ -1,8 +1,8 @@
-commit bf61a811f84c0f9285a3a0d38e8c64331cb96531
+commit 8e299157c07fd0bf57635f9cd0b6a41bc06352b8
 Author: Nick Kossifidis <mick@ics.forth.gr>
-Date:   Sat Jun 22 00:13:17 2024 +0300
+Date:   Tue Oct 29 23:26:37 2024 +0200
 
-    Add eupilot-vec machine, xxvnet_carv nic and a fix plic/emaclite
+    Add eupilot-vec machine, xxvnet_carv nic and a fix for plic/emaclite
 
 diff --git a/configs/devices/riscv64-softmmu/default.mak b/configs/devices/riscv64-softmmu/default.mak
 index bc69301..e332fb0 100644
@@ -1150,10 +1150,10 @@ index 2f7ee81..ce032bd 100644
  riscv_ss.add(when: 'CONFIG_SIFIVE_U', if_true: files('sifive_u.c'))
 diff --git a/hw/riscv/sdv3.c b/hw/riscv/sdv3.c
 new file mode 100644
-index 0000000..5c41814
+index 0000000..58b0932
 --- /dev/null
 +++ b/hw/riscv/sdv3.c
-@@ -0,0 +1,681 @@
+@@ -0,0 +1,701 @@
 +/*
 + * QEMU SDV3 board
 + *
@@ -1187,7 +1187,7 @@ index 0000000..5c41814
 +#include "hw/block/flash.h"
 +
 +/* SoC Properties */
-+#define SDV3_CPUS_MAX			4
++#define SDV3_CPUS_MAX			8
 +#define	SDV3_TIMEBASE_FREQ		25000000
 +#define SDV3_CLOCK_FREQ			50000000
 +#define SDV3_PLIC_NUM_SOURCES		20
@@ -1264,6 +1264,7 @@ index 0000000..5c41814
 +{
 +	MachineState *ms = MACHINE(st);
 +	int hart_count = st->cpus.num_harts;
++	int numa_node = 0;
 +	int i = 0;
 +	char *cpu_name;
 +	char *isa_string;
@@ -1283,6 +1284,8 @@ index 0000000..5c41814
 +		qemu_fdt_setprop_string(ms->fdt, cpu_name, "device_type", "cpu");
 +		qemu_fdt_setprop_string(ms->fdt, cpu_name, "compatible", "riscv");
 +		qemu_fdt_setprop_cell(ms->fdt, cpu_name, "reg", st->cpus.hartid_base + i);
++		numa_node = (i >= (SDV3_CPUS_MAX / 2)) ? 1 : 0;
++		qemu_fdt_setprop_cell(ms->fdt, cpu_name, "numa-node-id", numa_node);
 +
 +		isa_string = riscv_isa_string(cpu_ptr);
 +		qemu_fdt_setprop_string(ms->fdt, cpu_name, "riscv,isa", isa_string);
@@ -1308,13 +1311,30 @@ index 0000000..5c41814
 +{
 +	MachineState *ms = MACHINE(st);
 +	char *mem_name;
++	int hart_count = st->cpus.num_harts;
 +	uint64_t addr = sdv3_memmap[SDV3_DRAM].base;
 +	uint64_t size = ms->ram_size;
++
++	/* If more than 4 harts are available, split the memory region in two parts
++	 * for the two NUMA nodes. */
++	if (hart_count > (SDV3_CPUS_MAX / 2)) {
++		uint64_t size_top = size >> 1;
++		uint64_t addr_top = addr + size_top;
++		mem_name = g_strdup_printf("/memory@%" PRIx64, addr_top);
++		qemu_fdt_add_subnode(ms->fdt, mem_name);
++		qemu_fdt_setprop_string(ms->fdt, mem_name, "device_type", "memory");
++		qemu_fdt_setprop_cells(ms->fdt, mem_name, "reg", addr_top >> 32, addr_top,
++				      size_top >> 32, size_top);
++		qemu_fdt_setprop_cell(ms->fdt, mem_name, "numa-node-id", 1);
++		g_free(mem_name);
++		size = size_top;
++	}
 +
 +	mem_name = g_strdup_printf("/memory@%" PRIx64, addr);
 +	qemu_fdt_add_subnode(ms->fdt, mem_name);
 +	qemu_fdt_setprop_string(ms->fdt, mem_name, "device_type", "memory");
 +	qemu_fdt_setprop_cells(ms->fdt, mem_name, "reg", addr >> 32, addr, size >> 32, size);
++	qemu_fdt_setprop_cell(ms->fdt, mem_name, "numa-node-id", 0);
 +	g_free(mem_name);
 +}
 +
@@ -1483,7 +1503,7 @@ index 0000000..5c41814
 +	qemu_fdt_setprop_cell(ms->fdt, emaclite_mdio_name, "#address-cells", 0x1);
 +	qemu_fdt_setprop_cell(ms->fdt, emaclite_mdio_name, "#size-cells", 0x0);
 +	g_free(emaclite_mdio_name);
-+	
++
 +	/* Create /aliases/ethernet0 */
 +	qemu_fdt_setprop_string(ms->fdt, "/aliases", "ethernet0", emaclite_name);
 +
@@ -1735,7 +1755,7 @@ index 0000000..5c41814
 +	qdev_prop_set_uint32(dev, "rx-ping-pong", 1);
 +	sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 +	sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-+			   qdev_get_gpio_in(st->plic, SDV3_EMACLITE_IRQ));	
++			   qdev_get_gpio_in(st->plic, SDV3_EMACLITE_IRQ));
 +	mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
 +	memory_region_add_subregion(system_memory, sdv3_memmap[SDV3_EMACLITE].base, mr);
 +	error_report("emaclite at 0x%016lx\n", mr->addr);
@@ -1848,7 +1868,7 @@ index 91b3361..1d97d95 100644
  OBJECT_DECLARE_CPU_TYPE(RISCVCPU, RISCVCPUClass, RISCV_CPU)
  
 diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
-index 83c7c0c..c9931c3 100644
+index 77cb59b..b0ca3cd 100644
 --- a/target/riscv/cpu.c
 +++ b/target/riscv/cpu.c
 @@ -535,6 +535,41 @@ static void rv64_veyron_v1_cpu_init(Object *obj)
