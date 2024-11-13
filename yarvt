@@ -72,7 +72,7 @@ IPERF3_GITBRANCH="3.16"
 #RVGTOOLCHAIN_GITURL=https://github.com/riscv-collab/riscv-gnu-toolchain.git
 #RVGTOOLCHAIN_GITBRANCH="2024.02.02"
 RVGTOOLCHAIN_GITURL=https://github.com/CARV-ICS-FORTH/riscv-gnu-toolchain.git
-RVGTOOLCHAIN_GITBRANCH="uclibc"
+RVGTOOLCHAIN_GITBRANCH="2024.11.10"
 RVGTOOLCHAIN_GITCOMMIT=""
 RVGTOOLCHAIN_RELURL=https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/
 
@@ -211,7 +211,7 @@ function get_git_sources() {
 
 function get_git_submodule () {
 	local RECURSIVE=""
-	local SHALLOW="--recommend-shallow"
+	local SHALLOW="--depth=1"
 	local SUBMODULE_NAME=""
 	local SUBMODULE_PATH=""
 	if [[ ${GIT_CLONE_RECURSIVE} == 1 ]]; then
@@ -360,15 +360,15 @@ function get_tc_path() {
 	local TC_TYPE=${1}
 	local BASE_ISA_XLEN=${2}
 
-	# Musl is not multilib so it's in the same path
-	# if we fetch or build it. However there is no musl32 for
-	# now, so use glibc/glibc32 instead
+	# Musl and uclibc are not multilib so it's in the same path
+	# if we fetch or build it.
 	if [[ ${TC_TYPE} == "musl" ]]; then
-		if [[ ${BASE_ISA_XLEN} == 64 ]]; then
-			echo "${BINDIR}/riscv-musl${BASE_ISA_XLEN}-toolchain"
-		else
-			echo $(get_tc_path glibc 32)
-		fi
+		echo "${BINDIR}/riscv-musl${BASE_ISA_XLEN}-toolchain"
+		return 0
+	fi
+
+	if [[ ${TC_TYPE} == "uclibc" ]]; then
+		echo "${BINDIR}/riscv-uclibc${BASE_ISA_XLEN}-toolchain"
 		return 0
 	fi
 
@@ -387,14 +387,14 @@ function get_tc_tuple() {
 	local BASE_ISA_XLEN=${2}
 	local TUPLE=""
 
-	# Musl is not multilib so we always use riscv32/64, however there
-	# is no musl32 for now so use glibc/glibc32 instead
+	# Musl and uclibc are not multilib so we always use riscv32/64
 	if [[ ${TC_TYPE} == "musl" ]]; then
-		if [[ ${BASE_ISA_XLEN} == 64 ]]; then
-			echo "riscv${BASE_ISA_XLEN}-unknown-linux-musl"
-		else
-			echo $(get_tc_tuple glibc 32)
-		fi
+		echo "riscv${BASE_ISA_XLEN}-unknown-linux-musl"
+		return 0
+	fi
+
+	if [[ ${TC_TYPE} == "uclibc" ]]; then
+		echo "riscv${BASE_ISA_XLEN}-unknown-linux-uclibc"
 		return 0
 	fi
 
@@ -404,10 +404,6 @@ function get_tc_tuple() {
 
 	if [[ ${TC_TYPE} == "newlib" ]]; then
 		TUPLE="unknown-elf"
-	fi
-
-	if [[ ${TC_TYPE} == "uclibc" ]]; then
-		TUPLE="unknown-linux-uclibc"
 	fi
 
 	# Use multilib newlib/glibc if available
@@ -483,7 +479,6 @@ function build_busybox () {
 	pr_inf "Configuring BusyBox..."
 	cd "${SOURCES_DIR}"
 	make clean &>> ${LOGFILE}
-	make distclean &>> ${LOGFILE}
 	if [[ ${NOMMU_BUILD} == 1 ]]; then
 		cp "${SCRIPT_PATH}"/files/busybox.nommu ./.config.tmp
 	else
@@ -501,7 +496,7 @@ function build_busybox () {
 
 	pr_inf "Building BusyBox..."
 	make ARCH=riscv oldconfig &>> ${LOGFILE}
-	make ARCH=riscv -j${NUM_JOBS} &>> ${LOGFILE}
+	make ARCH=riscv -j ${NUM_JOBS} &>> ${LOGFILE}
 	make install &>> ${LOGFILE}
 	if [[ ! -f "${INSTALL_DIR}"/bin/busybox ]]; then
 		die "\tBuild failed, check out ${LOGFILE}" ${E_BUILD}
@@ -532,17 +527,18 @@ function build_dropbear () {
 	# as the image we are building just re-use it instead of recompiling it
 	# and getting the same binary anyway.
 	if [[ -f "${SOURCES_DIR}"/dropbearmulti ]]; then
-			${TARGET_TUPLE}-objdump -a "${SOURCES_DIR}"/dropbearmulti | grep "file format" | grep elf${BASE_ISA_XLEN} &>> ${LOGFILE}
-			if [[ $? == 0 ]]; then
-				pr_inf "Installing Dropbear..."
-				cp "${SOURCES_DIR}"/dropbearmulti "${INSTALL_DIR}"/bin/
-				cd "${INSTALL_DIR}"/bin
-				ln -s dropbearmulti dropbear
-				ln -s dropbearmulti ssh
-				ln -s dropbearmulti scp
-				cd "${SAVED_PWD}"
-				return
-			fi
+		${TARGET_TUPLE}-objdump -a "${SOURCES_DIR}"/dropbearmulti | grep "file format" | grep elf${BASE_ISA_XLEN} &>> ${LOGFILE}
+		if [[ $? == 0 ]]; then
+			pr_inf "Installing Dropbear..."
+			cp "${SOURCES_DIR}"/dropbearmulti "${INSTALL_DIR}"/bin/
+			cd "${INSTALL_DIR}"/bin
+			ln -s dropbearmulti dropbear
+			ln -s dropbearmulti ssh
+			ln -s dropbearmulti scp
+			cd "${SAVED_PWD}"
+			return
+		fi
+		make -C "${SOURCES_DIR}" distclean &>> ${LOGFILE}
 	fi
 
 	if [[ ${BASE_ISA_XLEN} == 64 ]]; then
@@ -562,9 +558,8 @@ function build_dropbear () {
 
 	pr_inf "Configuring Dropbear..."
 	cd "${SOURCES_DIR}"
-	make clean &>> ${LOGFILE}
-	make distclean &>> ${LOGFILE}
 	autoreconf -ivf &>> ${LOGFILE}
+	make clean &>> ${LOGFILE}
 	# Dropbear's LDFLAGS are actualy CFLAGS (it uses gcc to link)
 	CFLAGS="${EXTRA_CFLAGS} -ffunction-sections -fdata-sections" \
 	LDFLAGS="${EXTRA_CFLAGS} -Wl,--gc-sections" \
@@ -574,7 +569,7 @@ function build_dropbear () {
 		    --host=${TARGET_TUPLE} &>> ${LOGFILE}
 
 	pr_inf "Building Dropbear..."
-	make -j${NUM_JOBS} PROGRAMS="dropbear dbclient scp" MULTI=1 \
+	make -j ${NUM_JOBS} PROGRAMS="dropbear dbclient scp" MULTI=1 \
 							 &>> ${LOGFILE}
 	if [[ ! -f "${SOURCES_DIR}"/dropbearmulti ]]; then
 		die "\tBuild failed, check out ${LOGFILE}" ${E_BUILD}
@@ -598,6 +593,7 @@ function build_iperf () {
 	local TC_INSTALL_DIR=$(get_tc_path musl ${BASE_ISA_XLEN})
 	local TARGET_TUPLE=$(get_tc_tuple musl ${BASE_ISA_XLEN})
 	local EXTRA_CFLAGS=""
+	local EXTRA_LDFLAGS=""
 	local MARCH=rv${BASE_ISA_XLEN}imafdc
 	local MABI=""
 
@@ -607,21 +603,23 @@ function build_iperf () {
 	# as the image we are building just re-use it instead of recompiling it
 	# and getting the same binary anyway.
 	if [[ -f "${SOURCES_DIR}"/src/iperf3 ]]; then
-			${TARGET_TUPLE}-objdump -a "${SOURCES_DIR}"/src/iperf3 | grep "file format" | grep elf${BASE_ISA_XLEN} &>> ${LOGFILE}
-			if [[ $? == 0 ]]; then
-				pr_inf "Installing iperf3..."
-				cp "${SOURCES_DIR}"/src/iperf3 "${INSTALL_DIR}"/bin/
-				return
-			fi
+		${TARGET_TUPLE}-objdump -a "${SOURCES_DIR}"/src/iperf3 | grep "file format" | grep elf${BASE_ISA_XLEN} &>> ${LOGFILE}
+		if [[ $? == 0 ]]; then
+			pr_inf "Installing iperf3..."
+			cp "${SOURCES_DIR}"/src/iperf3 "${INSTALL_DIR}"/bin/
+			return
+		fi
+		make -C "${SOURCES_DIR}" distclean &>> ${LOGFILE}
 	fi
 
 	if [[ ${BASE_ISA_XLEN} == 64 ]]; then
 		MABI=lp64d
 	else
 		MABI=ilp32d
+		EXTRA_LDFLAGS="-l:libatomic.a"
 	fi
 
-	EXTRA_CFLAGS="-Os -march=${MARCH} -mabi=${MABI} -mcmodel=medany -flto=$(nproc) -ffat-lto-objects"
+	EXTRA_CFLAGS="-Os -march=${MARCH} -mabi=${MABI} -mcmodel=medany"
 
 	if [[ ! -d "${TC_INSTALL_DIR}" ]]; then
 		die "Toolchain not present, did you run bootstrap ?" ${E_NOTC}
@@ -632,17 +630,16 @@ function build_iperf () {
 
 	pr_inf "Configuring iperf3..."
 	cd "${SOURCES_DIR}"
-	make clean &>> ${LOGFILE}
-	make distclean &>> ${LOGFILE}
 	autoreconf -ivf &>> ${LOGFILE}
+	make clean &>> ${LOGFILE}
 	CFLAGS="${EXTRA_CFLAGS} -ffunction-sections -fdata-sections" \
-	LDFLAGS="${EXTRA_CFLAGS} -Wl,--gc-sections" \
+	LDFLAGS="${EXTRA_LDFLAGS} -Wl,--gc-sections" \
 	./configure --enable-static-bin --without-sctp --with-openssl=no \
 		    --prefix="${INSTALL_DIR}" \
 		    --host=${TARGET_TUPLE} &>> ${LOGFILE}
 
 	pr_inf "Building iperf3..."
-	make -j${NUM_JOBS} &>> ${LOGFILE}
+	make -j ${NUM_JOBS} &>> ${LOGFILE}
 	if [[ ! -f "${SOURCES_DIR}"/src/iperf3 ]]; then
 		die "\tBuild failed, check out ${LOGFILE}" ${E_BUILD}
 	fi
@@ -712,13 +709,14 @@ function build_toolchain () {
 	if [[ ${TC_TYPE} == "uclibc64" || ${TC_TYPE} == "uclibc32" ]]; then
 		get_git_submodule uclibc
 	fi
+
 	CLEAR_SOURCES=${SAVED_CLEAR_SOURCES}
 	GIT_CLONE_RECURSIVE=1
 
 	# Use medany code model by default
 	TC_OPTS="--with-cmodel=medany"
 
-	# Musl doesn't support multilib
+	# Musl/uclibc don't support multilib
 	if [[ ${TC_TYPE} == "newlib" || ${TC_TYPE} == "glibc" ]]; then
 		TC_OPTS="${TC_OPTS} --enable-multilib"
 	else
@@ -753,7 +751,7 @@ function build_toolchain () {
 	rm -rf "${INSTALL_DIR}" &>> ${LOGFILE}
 
 	pr_inf "Building ${TC_TYPE}-based toolchain..."
-	make -j${NUM_JOBS} ${TC_MKTARGET} &>> ${LOGFILE}
+	make -j ${NUM_JOBS} ${TC_MKTARGET} &>> ${LOGFILE}
 	if [[ $? != 0 ]]; then
 		die "\tBuild failed, check out ${LOGFILE}..." ${E_BUILD}
 	fi
@@ -768,33 +766,59 @@ function build_toolchain () {
 	cd "${SAVED_PWD}"
 }
 
-function fetch_toolchain() {
+function fetch_toolchain () {
 	local LOGFILE=${TMP_DIR}/toolchain.log
+	local IFS=$'\n'
 	local TC_TYPE=${1}
 	local BASE_ISA_XLEN=${2}
-	local INSTALL_DIR=""
-	local DOWNLOAD_URL=${RVGTOOLCHAIN_RELURL}/${RVGTOOLCHAIN_GITBRANCH}
+	local RELURL=${RVGTOOLCHAIN_GITURL%.git}/releases/download
+	local TAGS=()
+	local TUPLE=""
+	local OS_VERSION="ubuntu-22.04"
 	local FILENAME=""
+	local DOWNLOAD_URL=""
+	local HTTP_CODE=""
+	local INSTALL_DIR=""
+
+	pr_inf "Fetching riscv-${TC_TYPE}${BASE_ISA_XLEN}-toolchain..."
 
 	if [[ ${TC_TYPE} == "newlib" ]]; then
-		FILENAME=riscv${BASE_ISA_XLEN}-elf-ubuntu-20.04-gcc-nightly-${RVGTOOLCHAIN_GITBRANCH}-nightly.tar.gz
+		TUPLE=riscv${BASE_ISA_XLEN}-elf-${OS_VERSION}
 		INSTALL_DIR=riscv-newlib${BASE_ISA_XLEN}-toolchain
+	elif [[ ${TC_TYPE} == "uclibc" ]]; then
+		TUPLE=riscv${BASE_ISA_XLEN}-uclibc-ng-${OS_VERSION}
+		INSTALL_DIR=riscv-uclibc${BASE_ISA_XLEN}-toolchain
+	else
+		TUPLE=riscv${BASE_ISA_XLEN}-${TC_TYPE}-${OS_VERSION}
+		INSTALL_DIR=riscv-${TC_TYPE}${BASE_ISA_XLEN}-toolchain
 	fi
 
-	if [[ ${TC_TYPE} == "glibc" ]]; then
-		FILENAME=riscv${BASE_ISA_XLEN}-glibc-ubuntu-20.04-gcc-nightly-${RVGTOOLCHAIN_GITBRANCH}-nightly.tar.gz
-		INSTALL_DIR=riscv-glibc${BASE_ISA_XLEN}-toolchain
+	if [[ ${RVGTOOLCHAIN_GITBRANCH} != "" ]]; then
+		FILENAME=${TUPLE}-gcc-nightly-${RVGTOOLCHAIN_GITBRANCH}-nightly.tar.gz
+		DOWNLOAD_URL=${RELURL}/${RVGTOOLCHAIN_GITBRANCH}/${FILENAME}
+		HTTP_CODE=$(curl -o /dev/null --silent -Iw '%{http_code}' ${DOWNLOAD_URL})
+		echo ${FILENAME}: ${HTTP_CODE} &>> ${LOGFILE}
+		if [[ ${HTTP_CODE} != "302" ]]; then
+			pr_wrn "Could not find ${FILENAME}, trying other release tags"
+			TAGS=($(git -c 'versionsort.suffix=-' ls-remote --tags --sort='v:refname' ${RVGTOOLCHAIN_GITURL} |\
+				 awk -F "refs/tags/" '{print $2}' | grep $(date +%Y.) | sort -r))
+		fi
 	fi
-
-	if [[ ${TC_TYPE} == "musl" ]]; then
-		FILENAME=riscv${BASE_ISA_XLEN}-musl-ubuntu-20.04-gcc-nightly-${RVGTOOLCHAIN_GITBRANCH}-nightly.tar.gz
-		INSTALL_DIR=riscv-musl${BASE_ISA_XLEN}-toolchain
+	for i in ${TAGS[@]}; do
+		FILENAME=${TUPLE}-gcc-nightly-${i}-nightly.tar.gz
+		DOWNLOAD_URL=${RELURL}/${i}/${FILENAME}
+		HTTP_CODE=$(curl -o /dev/null --silent -Iw '%{http_code}' ${DOWNLOAD_URL})
+		echo ${FILENAME}: ${HTTP_CODE} &>> ${LOGFILE}
+		if [[ ${HTTP_CODE} == "302" ]]; then
+			break
+		fi
+	done
+	if [[ ${HTTP_CODE} != "302" ]]; then
+		pr_wrn "Couldn't fild release artifact for ${TUPLE}"
+		return 1
 	fi
-
-	DOWNLOAD_URL=${DOWNLOAD_URL}/${FILENAME}
 
 	cd ${BINDIR}
-	pr_inf "Fetching riscv-${TC_TYPE}${BASE_ISA_XLEN}-toolchain..."
 	wget ${DOWNLOAD_URL} &>> ${LOGFILE}
 	mkdir ${INSTALL_DIR} &>> ${LOGFILE}
 	# Note that the structore is riscv/<stuff>, get rid of riscv/ so that
@@ -811,8 +835,8 @@ function fetch_toolchain() {
 	rm -rf ${INSTALL_DIR}/share/qemu &>> ${LOGFILE}
 	rm ${INSTALL_DIR}/include/qemu-plugin.h &>> ${LOGFILE}
 	deduplicate_files ${INSTALL_DIR} &>> ${LOGFILE}
-
 	cd "${SAVED_PWD}"
+	return 0
 }
 
 function build_qemu () {
@@ -844,7 +868,7 @@ function build_qemu () {
 	fi
 
 	pr_inf "Building riscv-32/riscv-64 QEMU..."
-	make -j${NUM_JOBS} &>> ${LOGFILE}
+	make -j ${NUM_JOBS} &>> ${LOGFILE}
 	if [[ $? != 0 ]]; then
 		die "\tBuild failed, check out ${LOGFILE}..." ${E_BUILD}
 	fi
@@ -867,6 +891,7 @@ function build_linux () {
 	local BASE_ISA_XLEN=$(echo ${BASE_ISA} | tr -d [:alpha:])
 	local TC_INSTALL_DIR=$(get_tc_path glibc ${BASE_ISA_XLEN})
 	local CC_PREFIX=$(get_tc_tuple glibc ${BASE_ISA_XLEN})-
+	local CONFIG_FRAGMENTS=""
 
 	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
@@ -896,37 +921,43 @@ function build_linux () {
 	make clean &>> ${LOGFILE}
 	make distclean &>> ${LOGFILE}
 
+	if [[ ${NOMMU_BUILD} == 1 ]]; then
+		echo "CONFIG_NONPORTABLE=y" > arch/riscv/configs/linux-nommu.config
+		echo "# CONFIG_RISCV_M_MODE is not set" >> arch/riscv/configs/linux-nommu.config
+		echo "# CONFIG_MMU is not set" >> arch/riscv/configs/linux-nommu.config
+		# Note: currently this can't be changed, it requires a kernel patch
+		# it'll always have a value of 0x80200000.
+		if [[ ${BASE_ISA} == "RV32I" ]]; then
+			printf "CONFIG_PAGE_OFFSET=0x%X\n" $(( ${MEM_START} + 0x400000 )) >> arch/riscv/configs/linux-nommu.config
+		else
+			printf "CONFIG_PAGE_OFFSET=0x%X\n" $(( ${MEM_START} + 0x200000 )) >> arch/riscv/configs/linux-nommu.config
+		fi
+		echo "CONFIG_PHYS_RAM_BASE_FIXED=y" >> arch/riscv/configs/linux-nommu.config
+		echo "CONFIG_PHYS_RAM_BASE=${MEM_START}" >> arch/riscv/configs/linux-nommu.config
+		CONFIG_FRAGMENTS="linux-nommu.config"
+	fi
+
+	if [[ ${BASE_ISA} == "RV32I" ]]; then
+		CONFIG_FRAGMENTS="32-bit.config ${CONFIG_FRAGMENTS}"
+	fi
+
 	if [[ -f "${CONFIG_DIR}"/linux ]]; then
 		pr_dbg "Using provided config file"
 		cp "${CONFIG_DIR}"/linux ./.config
 		ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
-		make olddefconfig &>> ${LOGFILE}
+		make olddefconfig ${CONFIG_FRAGMENTS} &>> ${LOGFILE}
 	else
-		if [[ ${BASE_ISA} == "RV32I" ]]; then
-			ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
-			make rv32_defconfig &>> ${LOGFILE}
-		else
-			ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
-			make defconfig &>> ${LOGFILE}
-		fi
+		ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
+		make defconfig ${CONFIG_FRAGMENTS} &>> ${LOGFILE}
 	fi
 
 	if [[ $? != 0 ]]; then
 		die "\tConfig failed, check out ${LOGFILE}..." ${E_CONFIG}
 	fi
 
-	# Switch to 32bit configuration, olddefconfig
-	# should handle dependencies apropriately
-	if [[ ${BASE_ISA} == "RV32I" ]]; then
-		sed -i s#CONFIG_ARCH_RV64I#CONFIG_ARCH_RV32I#g .config
-		sed -i s#CONFIG_64BIT#CONFIG_32BIT#g .config
-		ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
-		make olddefconfig &>> ${LOGFILE}
-	fi
-
 	pr_inf "Building Linux kernel..."
 	ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
-	make -j${NUM_JOBS} &>> ${LOGFILE}
+	make -j ${NUM_JOBS} &>> ${LOGFILE}
 	if [[ $? != 0 ]]; then
 		die "\tBuild failed, check out ${LOGFILE}..." ${E_BUILD}
 	fi
@@ -957,7 +988,7 @@ function build_linux () {
 		rm arch/riscv/boot/Image.gz &>> ${LOGFILE}
 		fakeroot -i ${TMP_DIR}/frstate -- make \
 		ARCH=riscv CROSS_COMPILE=${CC_PREFIX} \
-		-j${NUM_JOBS} &>> ${LOGFILE}
+		-j ${NUM_JOBS} &>> ${LOGFILE}
 		if [[ $? != 0 ]]; then
 			die "\tBuild failed, check out ${LOGFILE}..." ${E_BUILD}
 		fi
@@ -1023,7 +1054,7 @@ function build_osbi () {
 	pr_inf "Building OpenSBI..."
 	CROSS_COMPILE=${CC_PREFIX} PLATFORM_RISCV_XLEN=${BASE_ISA_XLEN} \
 	make PLATFORM=${OSBI_PLATFORM} ${OSBI_MAKE_PARAMS} \
-	-j${NUM_JOBS} &>> ${LOGFILE}
+	-j ${NUM_JOBS} &>> ${LOGFILE}
 	if [[ $? != 0 ]]; then
 		die "\tBuild failed, check out ${LOGFILE}..." ${E_BUILD}
 	fi
@@ -1099,27 +1130,35 @@ function build_rootfs () {
 }
 
 function bootstrap () {
+	local LOGFILE=${TMP_DIR}/bootstrap.log
 	if [[ ${TARGET} != "" ]]; then
 		target_bootstrap
 	else
 		build_toolchain newlib
 		build_toolchain glibc
-		#build_toolchain musl32
+		build_toolchain musl32
 		build_toolchain musl64
 		build_toolchain uclibc32
 		build_toolchain uclibc64
+		deduplicate_files ${BINDIR} &>> ${LOGFILE}
 		build_qemu
 	fi
 }
 
 function bootstrap_fast () {
-	build_qemu
+	local LOGFILE=${TMP_DIR}/bootstrap.log
 	pr_ann "Fetching toolchains from riscv-gnu-toolchain repository"
 	fetch_toolchain newlib 32 &
 	fetch_toolchain newlib 64 &
 	fetch_toolchain glibc 32 &
 	fetch_toolchain glibc 64 &
-	fetch_toolchain musl 64
+	fetch_toolchain musl 32 &
+	fetch_toolchain musl 64 &
+	fetch_toolchain uclibc 32 &
+	fetch_toolchain uclibc 64 &
+	wait
+	deduplicate_files ${BINDIR} &>> ${LOGFILE}
+	build_qemu
 }
 
 function setup_env () {
@@ -1155,7 +1194,7 @@ if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
 	return 0
 fi
 
-pr_ann "Yet another RISC-V tool v0.8"
+pr_ann "Yet another RISC-V tool v0.9"
 env_check "$@"
 
 mkdir -p "${SOURCES}" &> /dev/null
