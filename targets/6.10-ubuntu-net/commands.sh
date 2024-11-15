@@ -7,6 +7,9 @@ function target_usage () {
 	pr_inf "\tbootstrap: (Re)Build unified image (osbi + Linux)"
 	pr_inf "\trun_on_qemu: Test unified image on QEMU"
 	pr_wrn "\t<arg> Rootfs path on host's NFS server"
+	pr_inf "\tboot_node: Run unified image on QEMU, in a multi-instance scenario"
+	pr_wrn "\t<arg> Rootfs path on host's NFS server"
+	pr_wrn "\t<arg> Node ID (1 - 253)"
 }
 
 function target_env_check() {
@@ -23,7 +26,8 @@ function target_env_check() {
 	fi
 
 	# Command filter
-	if [[ "${2}" != "bootstrap" && "${2}" != "run_on_qemu" ]]; then
+	if [[ "${2}" != "bootstrap" && "${2}" != "run_on_qemu" && \
+	      "${2}" != "boot_node" ]]; then
 		pr_err "Invalid command for ${1}"
 		target_usage ${1}
 		echo -e "\n"
@@ -74,9 +78,57 @@ function run_on_qemu () {
 	# The reason is emaclite is too slow (and has significant packet loss) to run Linux with rootfs over NFS relialbly, dma
 	# based ethernet on the other hand is much better.
 	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 4G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
-		-nic user,id=hnet1,smb=/home/$(whoami) \
+		-nic user,id=hnet1,smb=${HOME} \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
-		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot-vec:eth1:dhcp:: ro"
+		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot-vec:eth1:dhcp:: rw"
+
+	cd ${SAVED_PWD}
+}
+
+function boot_node () {
+	local SAVED_PWD=${PWD}
+	local QEMU_INSTALL_DIR=${BINDIR}/riscv-qemu
+	local OSBI_INSTALL_DIR=${WORKDIR}/${BASE_ISA}/riscv-opensbi
+	local LINUX_INSTALL_DIR=${WORKDIR}/${BASE_ISA}/riscv-linux
+	local BASE_ISA_XLEN=$(echo ${BASE_ISA} | tr -d [:alpha:])
+	local QEMU=${QEMU_INSTALL_DIR}/bin/qemu-system-riscv${BASE_ISA_XLEN}
+	local BIOS=${OSBI_INSTALL_DIR}/fw_jump.elf
+
+	if [[ $# -lt 1 ]]; then
+		pr_err "Exported NFS path for rootfs on host is required"
+		exit ${E_INVAL};
+	fi
+
+	if [[ ! -e ${1} ]]; then
+		pr_err "Provided path on host doesn't exist"
+		exit ${E_INVAL};
+	fi
+
+	if [[ $# -lt 2 ]]; then
+		pr_err "Node ID not provided"
+		exit ${E_INVAL};
+	fi
+
+	local NODE_ID=${2}
+
+	if ! [[ ${NODE_ID} =~ ^[0-9]+$ ]]; then
+		pr_err "Invalid Node ID"
+		exit ${E_INVAL};
+	fi
+
+	if (( ${NODE_ID} <= 0 || ${NODE_ID} >= 254 )); then
+		pr_err "Node ID out of range"
+		exit ${E_INVAL};
+	fi
+
+	local IP_OFFSET=$((${NODE_ID} + 1))
+	local IP_ADDR="192.168.1.${IP_OFFSET}"
+	local HOSTNAME="eupilot-node-${NODE_ID}"
+
+	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,smb=${HOME}  \
+		-nic bridge,br=virbr0,id=hnet1 \
+		-kernel ${LINUX_INSTALL_DIR}/Image \
+		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=${IP_ADDR}:192.168.1.1:192.168.1.1:255.255.255.0:${HOSTNAME}:eth1:off: systemd.hostname=${HOSTNAME} ro"
 
 	cd ${SAVED_PWD}
 }

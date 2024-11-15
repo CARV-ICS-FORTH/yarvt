@@ -57,7 +57,7 @@ function run_on_qemu () {
 	local QEMU=${QEMU_INSTALL_DIR}/bin/qemu-system-riscv${BASE_ISA_XLEN}
 	local BIOS=${OSBI_INSTALL_DIR}/fw_payload.bin
 
-	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,id=hnet0,smb=/home/$(whoami) \
+	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,id=hnet0,smb=${HOME} \
 		-bios ${BIOS}
 
 	cd ${SAVED_PWD}
