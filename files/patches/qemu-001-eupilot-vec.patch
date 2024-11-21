@@ -13,23 +13,6 @@ index bc69301..e332fb0 100644
  CONFIG_MICROCHIP_PFSOC=y
  CONFIG_SHAKTI_C=y
 +CONFIG_SDV3=y
-diff --git a/hw/intc/sifive_plic.c b/hw/intc/sifive_plic.c
-index 5522ede..3df50e4 100644
---- a/hw/intc/sifive_plic.c
-+++ b/hw/intc/sifive_plic.c
-@@ -348,7 +348,11 @@ static void parse_hart_config(SiFivePLICState *plic)
- static void sifive_plic_irq_request(void *opaque, int irq, int level)
- {
-     SiFivePLICState *s = opaque;
--
-+    /* Don't allow sources/gateways to clear the pending bit,
-+     * the pending bit should only be cleared when interrupt is
-+     * claimed by the host. */
-+    if (level <= 0)
-+        return;
-     sifive_plic_set_pending(s, irq, level > 0);
-     sifive_plic_update(s);
- }
 diff --git a/hw/net/Kconfig b/hw/net/Kconfig
 index 7fcc0d7..a289ae0 100644
 --- a/hw/net/Kconfig
