@@ -43,6 +43,7 @@ ip route add 127.0.0.0/255.0.0.0 dev lo &> /dev/null
 
 # Grab some parameters from kernel's cmdline
 SINGLE=0
+INSTALLER=""
 CMDLINE=$(xargs -n1 -a /proc/cmdline)
 for arg in ${CMDLINE}; do
 	case "${arg}" in
@@ -51,6 +52,9 @@ for arg in ${CMDLINE}; do
 			;;
 		rescue)
 			SINGLE=1
+			;;
+		installer=*)
+			INSTALLER="${arg#installer=}"
 			;;
 	esac
 done
@@ -83,9 +87,11 @@ if [[ $? == 0 ]]; then
 		ip link set eth0 up &> /dev/null
 		udhcpc -b -S -R &> /dev/null &
 	fi
-	dropbear -R -m -b /etc/motd &
-	mkdir -p /usr/bin
-	ln -s /bin/dropbearmulti /usr/bin/dbclient
+	if command -v dropbear &> /dev/null ; then
+		dropbear -R -m -b /etc/motd &
+		mkdir -p /usr/bin
+		ln -s /bin/dropbearmulti /usr/bin/dbclient
+	fi
 	ntpd &
 	echo "You may login remotely through ssh over network or" > /dev/console
 	if [[ ${SINGLE} -eq 0 ]]; then
@@ -93,6 +99,15 @@ if [[ $? == 0 ]]; then
 	else
 		echo "your host's port 2222 (in case of QEMU) using root/riscv" > /dev/console
 	fi
+fi
+
+# Run the installer if needed
+if [[ "${INSTALLER}" == "alpine" ]]; then
+	echo "Running alpine installer..."
+	installer-alpine
+elif [[ "${INSTALLER}" == "ubuntu" ]]; then
+	echo "Running ubuntu installer..."
+	installer-ubuntu
 fi
 
 # Get console

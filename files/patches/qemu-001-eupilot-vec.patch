@@ -1904,3 +1904,18 @@ index 77cb59b..b0ca3cd 100644
      DEFINE_DYNAMIC_CPU(TYPE_RISCV_CPU_BASE128,  rv128_base_cpu_init),
  #endif
  };
+diff --git a/hw/riscv/boot.c b/hw/riscv/boot.c
+index 0ffca05..0547895 100644
+--- a/hw/riscv/boot.c
++++ b/hw/riscv/boot.c
+@@ -208,8 +208,8 @@ static void riscv_load_initrd(MachineState *machine, uint64_t kernel_entry)
+     /* Some RISC-V machines (e.g. opentitan) don't have a fdt. */
+     if (fdt) {
+         end = start + size;
+-        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-start", start);
+-        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-end", end);
++        qemu_fdt_setprop_u64(fdt, "/chosen", "linux,initrd-start", start);
++        qemu_fdt_setprop_u64(fdt, "/chosen", "linux,initrd-end", end);
+     }
+ }
+ 
