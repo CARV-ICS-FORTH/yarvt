@@ -1515,7 +1515,7 @@ index 0000000..58b0932
 +	qemu_fdt_setprop_cells(ms->fdt, xxvnet_name, "interrupts", SDV3_DMAETH_TX_IRQ, SDV3_DMAETH_RX_IRQ);
 +
 +	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "xlnx,rxmem", 4096);
-+	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "carv,mtu", 1500);
++	qemu_fdt_setprop_cell(ms->fdt, xxvnet_name, "carv,mtu", 3072);
 +	qemu_fdt_setprop(ms->fdt, xxvnet_name, "xlnx,include-dre", NULL, 0);
 +
 +	/* TODO: Clean up this mess on the driver side ! */

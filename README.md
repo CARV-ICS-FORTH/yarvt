@@ -175,6 +175,7 @@ In order for QEMU to use the virbr0 we need to allow it, and we also need to set
 mkdir -p ./build/riscv-qemu/etc/qemu
 echo "allow virbr0" > ./build/riscv-qemu/etc/qemu/bridge.conf
 chmod 0640 ./build/riscv-qemu/etc/qemu/bridge.conf
+chown root:root ./build/riscv-qemu/libexec/qemu-bridge-helper
 chmod u+s ./build/riscv-qemu/libexec/qemu-bridge-helper
 ```
 
