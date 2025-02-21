@@ -160,21 +160,23 @@ For providing internet access to the guests, we need iptables for NAT (so make s
 All commands in this step require root privileges in the host unfortunately, and the first part needs to be executed again in case of a host reboot.
 
 ```
-ip link add name virbr0 type bridge
-ip link set virbr0 up
-ip addr add dev virbr0 192.168.1.1/24
+ip link add name nodebridge0 type bridge
+ip link set nodebridge0 up
+ip addr add dev nodebridge0 192.168.1.1/24
 echo 1 > /proc/sys/net/ipv4/ip_forward
 iptables -t nat -A POSTROUTING -o lan -j MASQUERADE
 ```
 
 The user backend is still used to provide access to the user's home folder through cifs (as in Step 2), only in this case the traffic for reaching the home folder goes through eth0 (emaclite) since we use eth1 (dma-based ethernet) with the bridge backend that doesn't do any network emulation (just forwards packets to the kernel's bridge).
 
-In order for QEMU to use the virbr0 we need to allow it, and we also need to set suid bit on the bridge helper since it needs to run with root privileges (this is only needed once):
+In order for QEMU to use the nodebridge0 we need to allow it, and we also need to set suid bit on the bridge helper since it needs to run with root privileges (this is only needed once):
 
 ```
 mkdir -p ./build/riscv-qemu/etc/qemu
-echo "allow virbr0" > ./build/riscv-qemu/etc/qemu/bridge.conf
-chmod 0640 ./build/riscv-qemu/etc/qemu/bridge.conf
+echo "allow nodebridge0" > ./build/riscv-qemu/etc/qemu/bridge.conf
+chown root:root ./build/riscv-qemu/etc/qemu/bridge.conf
+chmod ugo+r ./build/riscv-qemu/etc/qemu/bridge.conf
+chmod go-w ./build/riscv-qemu/etc/qemu/bridge.conf
 chown root:root ./build/riscv-qemu/libexec/qemu-bridge-helper
 chmod u+s ./build/riscv-qemu/libexec/qemu-bridge-helper
 ```

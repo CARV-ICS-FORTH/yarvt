@@ -137,8 +137,10 @@ function initialize_rootfs () {
 	echo "nameserver 10.0.2.3" > ${PREFIX}/etc/resolv.conf
 	# So that we can resolve while under installer
 	echo "nameserver 10.0.3.3" >> ${PREFIX}/etc/resolv.conf
+	# Fallback
+	echo "nameserver 1.1.1.1" >> ${PREFIX}/etc/resolv.conf
 	# Just in case user enables networkd/resolved later on
-	echo "DNS=10.0.2.3" >> ${PREFIX}/etc/systemd/resolved.conf
+	echo "DNS=10.0.2.3 10.0.3.3 1.1.1.1" >> ${PREFIX}/etc/systemd/resolved.conf
 
 	echo "" > ${PREFIX}/etc/fstab
 
@@ -169,6 +171,7 @@ function initialize_rootfs () {
 	run_in_chroot apt-get purge -y apport apparmor appstream bcache-tools bolt cloud-guest-utils cloud-init cloud-initramfs-copymods cloud-initramfs-dyn-netconf eatmydata finalrd friendly-recovery fwupd modemmanager netplan-generator netplan.io open-iscsi snapd squashfs-tools tcl thin-provisioning-tools ubuntu-pro-client ufw unattended-upgrades mdadm udisks2 lxd-* multipath-tools plymouth* rsyslog pollinate lvm2
 	run_in_chroot apt-get autoremove -y --purge
 	run_in_chroot apt-get clean
+	rm ${PREFIX}/etc/ssh/sshd_config.d/60-cloudimg-settings.conf
 	# Cleanup any pre-installed man pages / docs, unused locales, translations etc
 	pr_inf "Cleaning up disk space..."
 	rm -rf ${PREFIX}/usr/share/man/*
@@ -182,8 +185,23 @@ function initialize_rootfs () {
 	pr_inf "Updating package list"
 	run_in_chroot apt-get update
 
-	pr_inf "Disabling systemd-networkd (networking configured by kernel)"
-	run_in_chroot systemctl disable systemd-networkd
+	pr_inf "Configuring systemd-networkd (networking configured by kernel)"
+	echo -e "[Match]\nName=eth0\n\n[Network]\nDHCP=ipv4\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\n" > ${PREFIX}/etc/systemd/network/20-eth0.network
+	echo -e "[Match]\nName=eth1\n\n[Link]\nUnmanaged=yes\n" > ${PREFIX}/etc/systemd/network/10-ignore-eth1.network
+	run_in_chroot systemctl enable systemd-networkd
+
+	pr_inf "Disabling systemd-resolved (hardcoded namsesrvers by default)"
+	run_in_chroot systemctl disable systemd-resolved
+
+	pr_inf "Preventing systemd-udevd from modifying mac addresses asigned by kernel"
+	ln -s /dev/null ${PREFIX}/etc/systemd/network/99-default.link
+
+	pr_inf "Disabling sysstat service"
+	run_in_chroot systemctl disable sysstat
+
+	pr_inf "Enabling ssh daemon and generating host keys"
+	run_in_chroot dpkg-reconfigure openssh-server
+	run_in_chroot systemctl enable ssh
 
 	pr_inf "Downloading BSC RISC-V LLVM toolchain"
 	run_in_chroot wget https://admin.hca.bsc.es/epi/ftp/llvm-EPI-development-toolchain-native-latest.tar.bz2 -P /opt

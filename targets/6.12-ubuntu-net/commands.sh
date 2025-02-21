@@ -129,7 +129,7 @@ function boot_node () {
 	local HOSTNAME="eupilot-node-${NODE_ID}"
 
 	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 2G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,smb=${HOME}  \
-		-nic bridge,br=virbr0,id=hnet1 \
+		-nic bridge,br=nodebridge0,id=hnet1 \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
 		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=${IP_ADDR}:192.168.1.1:192.168.1.1:255.255.255.0:${HOSTNAME}:eth1:off: systemd.hostname=${HOSTNAME} ro"
 
