@@ -161,6 +161,7 @@ All commands in this step require root privileges in the host unfortunately, and
 
 ```
 ip link add name nodebridge0 type bridge
+ip link set nodebridge0 mtu 3072
 ip link set nodebridge0 up
 ip addr add dev nodebridge0 192.168.1.1/24
 echo 1 > /proc/sys/net/ipv4/ip_forward
