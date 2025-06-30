@@ -965,7 +965,6 @@ function build_linux () {
 	pr_inf "Copying kernel image and modules..."
 	cp vmlinux "${INSTALL_DIR}"/
 	cp arch/riscv/boot/Image "${INSTALL_DIR}"/
-	cp arch/riscv/boot/Image.gz "${INSTALL_DIR}"/
 	INSTALL_MOD_PATH="${INSTALL_DIR}" ARCH=riscv \
 	make modules_install &>> ${LOGFILE}
 	if [[ $? != 0 ]]; then
