@@ -10,6 +10,9 @@ function target_usage () {
 	pr_inf "\tboot_node: Run unified image on QEMU, in a multi-instance scenario"
 	pr_wrn "\t<arg> Rootfs path on host's NFS server"
 	pr_wrn "\t<arg> Node ID (1 - 253)"
+	pr_inf "\trun_installer: Build and run the installer script on the rootfs"
+	pr_wrn "\t<arg> Distro to install: ubuntu / alpine"
+	pr_wrn "\t<arg> Rootfs path on host's NFS server"
 }
 
 function target_env_check() {
@@ -27,7 +30,7 @@ function target_env_check() {
 
 	# Command filter
 	if [[ "${2}" != "bootstrap" && "${2}" != "run_on_qemu" && \
-	      "${2}" != "boot_node" ]]; then
+	      "${2}" != "boot_node" && "${2}" != "run_installer" ]]; then
 		pr_err "Invalid command for ${1}"
 		target_usage ${1}
 		echo -e "\n"
@@ -129,6 +132,51 @@ function boot_node () {
 		-nic bridge,br=virbr0,id=hnet1 \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
 		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=${IP_ADDR}:192.168.1.1:192.168.1.1:255.255.255.0:${HOSTNAME}:eth1:off: systemd.hostname=${HOSTNAME} ro"
+
+	cd ${SAVED_PWD}
+}
+
+function run_installer () {
+	local SAVED_PWD=${PWD}
+	local QEMU_INSTALL_DIR=${BINDIR}/riscv-qemu
+	local BASE_ISA_XLEN=$(echo ${BASE_ISA} | tr -d [:alpha:])
+	local LINUX_INSTALL_DIR=${WORKDIR}/${BASE_ISA}/riscv-linux
+	local ROOTFS_INSTALL_DIR=${WORKDIR}/${BASE_ISA}/rootfs/
+	local QEMU=${QEMU_INSTALL_DIR}/bin/qemu-system-riscv${BASE_ISA_XLEN}
+
+	if ! [[ -d ${LINUX_INSTALL_DIR} ]]; then
+		pr_err "Kernel installation dir not present, you need to run bootstrap first"
+		exit ${E_INVAL}
+	fi
+
+	if [[ $# -lt 2 ]]; then
+		pr_err "Invalid number of arguments"
+		target_usage
+		exit ${E_INVAL};
+	fi
+
+	if [[ "${1}" != "alpine" && "${1}" != "ubuntu" ]]; then
+		pr_err "Invalid distro argument"
+		target_usage
+		exit ${E_INVAL};
+	fi
+
+	if [[ ! -e ${2} ]]; then
+		pr_err "Provided path on host doesn't exist"
+		exit ${E_INVAL};
+	fi
+
+	if ! [[ -d ${ROOTFS_INSTALL_DIR} ]]; then
+		pr_inf "First time this runs, build rootfs for installer"
+		NO_NETWORK=1
+		build_rootfs
+	fi
+
+	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 8G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
+		-nic user,id=hnet1,smb=${HOME} \
+		-kernel ${LINUX_INSTALL_DIR}/Image \
+		-initrd ${ROOTFS_INSTALL_DIR}/initramfs.img \
+		-append "installer_prefix=${2} installer=${1} ip=::::eupilot:eth1:dhcp::"
 
 	cd ${SAVED_PWD}
 }
