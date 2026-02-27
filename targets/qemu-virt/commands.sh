@@ -6,8 +6,8 @@ function target_usage () {
 	pr_inf "\tbuild_osbi: (Re)Build OpenSBI"
 	pr_inf "\tbuild_linux: (Re)Build a defconfig RISC-V Linux kernel"
 	pr_inf "\tbuild_rootfs: (Re)Build a minimal rootfs on initramfs"
-	pr_inf "\trun_linux32_osbi: Run a 32bit QEMU instance with osbi+linux+initramfs"
-	pr_inf "\trun_linux64_osbi: Run a 64bit QEMU instance with osbi+linux+initramfs"
+	pr_inf "\trun_linux32: Run a 32bit QEMU instance with osbi+linux+initramfs"
+	pr_inf "\trun_linux64: Run a 64bit QEMU instance with osbi+linux+initramfs"
 }
 
 function target_env_check() {
@@ -27,7 +27,7 @@ function target_env_check() {
 	if [[ "${2}" != "build_linux" && \
 	      "${2}" != "build_rootfs" && "${2}" != "bootstrap" && \
 	      "${2}" != "build_osbi" && \
-	      "${2}" != "run_linux32_osbi" && "${2}" != "run_linux64_osbi" ]];
+	      "${2}" != "run_linux32" && "${2}" != "run_linux64" ]];
 	      then
 		pr_err "Invalid command for ${1}"
 		target_usage
@@ -78,12 +78,12 @@ function run_linux () {
 	KEEP_LOGS=0
 }
 
-function run_linux32_osbi () {
+function run_linux32 () {
 	BASE_ISA=RV32I
 	run_linux
 }
 
-function run_linux64_osbi () {
+function run_linux64 () {
 	BASE_ISA=RV64I
 	run_linux
 }

@@ -1,0 +1,265 @@
+#!/bin/bash
+PREFIX=${1}
+
+##################
+# CONSOLE OUTPUT #
+##################
+
+function pr_ann () {
+	echo -e "\e[32m \n--=== ${1} ===--\e[0m"
+}
+
+function pr_inf () {
+	echo -e "\e[36m${1}\e[0m"
+}
+
+function pr_wrn () {
+	echo -e "\e[33m${1}\e[0m"
+}
+
+function pr_err () {
+	>&2 echo -e "\e[31m${1}\e[0m"
+}
+
+###########
+# HELPERS #
+###########
+
+function run_in_chroot() {
+	chroot ${PREFIX} $@
+}
+
+###################
+# INSTALLER STEPS #
+###################
+function timesync () {
+	local HTTP_DATE_STRING=$(wget -qS www.google.com -O /dev/null 2>&1 | grep "Date:" | awk -F", " '{print $2}' | awk '{print $3"-"$2"-"$1" "$4}')
+	local MONTH_STR=$(echo ${HTTP_DATE_STRING} | awk -F"-" '{print $2}')
+	local MONTHS="JanFebMarAprMayJunJulAugSepOctNovDec"
+	local MONTHS_TRIMMED=${MONTHS%%$MONTH_STR*}
+	local MONTHS_TRIMMED_LEN=${#MONTHS_TRIMMED}
+	local MONTH_NUM=$(printf "%02d" $((MONTHS_TRIMMED_LEN/3+1)))
+	local DATE_STRING=$(echo ${HTTP_DATE_STRING} | sed -e "s/${MONTH_STR}/${MONTH_NUM}/g")
+	pr_ann "Syncing time with google.com"
+        pr_inf "Http date string: \"${HTTP_DATE_STRING}\""
+        date -u "${DATE_STRING}"
+}
+
+function get_prefix_from_cmdline () {
+	local CMDLINE_PREFIX=$(cat /proc/cmdline | awk -F "installer_prefix=" '{print $2}' | awk '{print $1}')
+	if [[ "${CMDLINE_PREFIX}" != "" ]]; then
+		pr_inf "Got installer prefix from kernel cmdline: ${CMDLINE_PREFIX}"
+		pr_inf "Mounting NFS export to /mnt/target"
+		PREFIX=/mnt/target
+		mkdir -p ${PREFIX}
+
+		# Increase MTU size as much as we can (our hw goes up to 4k)
+		# Note that whatever goes outside is limited by the host's MTU
+		# so this shouldn't be an issue when downloading stuff (we
+		# are using user-level networking, so no bridge etc).
+		ip link set eth1 down
+		ip link set dev eth1 mtu 3626
+		ip link set eth1 up
+		ip route add default via 10.0.2.2
+
+		mount -tnfs4 -orsize=8192,wsize=8192 10.0.2.2:${CMDLINE_PREFIX} ${PREFIX}
+		if [[ $? != 0 ]]; then
+			pr_err "Couldn't mount NFS export"
+			exit 1
+		fi
+		ls -lah ${PREFIX}/* &> /dev/null
+		if [[ $? == 0 ]]; then
+			pr_err "NFS Export not empty"
+			exit 1
+		fi
+	else
+		exit 1
+	fi
+}
+
+function download_initrootfs () {
+	local REL="noble"
+	local REL_URL="http://cloud-images.ubuntu.com/${REL}/current/"
+	local FILE=${REL}-server-cloudimg-riscv64-root.tar.xz
+	local DOWNLOAD_URL=${REL_URL}/${FILE}
+	local SAVED_PWD=${PWD}
+
+	pr_ann "Downloading base rootfs..."
+
+	mkdir -p ${PREFIX} &> /dev/null
+	cd ${PREFIX}
+	wget ${DOWNLOAD_URL}
+
+	pr_ann "Unpacking base rootfs..."
+#	tar xJpf ${FILE} --xattrs-include='*.*' --numeric-owner &> /dev/null
+	tar xJf ${FILE} --numeric-owner &> /dev/null
+
+	rm ${FILE}
+	cd ${SAVED_PWD}
+}
+
+function prepare_chroot () {
+	pr_ann "Setting up chroot environment"
+
+	pr_inf "Mounting /proc"
+	mount -t proc none ${PREFIX}/proc
+
+	pr_inf "Mounting /dev"
+	mount --rbind /dev ${PREFIX}/dev
+	mount --make-rslave ${PREFIX}/dev
+
+	pr_inf "Mounting /sys"
+	mount --rbind /sys ${PREFIX}/sys
+	mount --make-rslave ${PREFIX}/sys
+
+	pr_inf "Mounting /run"
+	if [[ -d /run ]]; then
+		mount --rbind /run ${PREFIX}/run
+		mount --make-rslave ${PREFIX}/run
+	fi
+}
+
+
+function initialize_rootfs () {
+	local SAVED_PWD=${PWD}
+
+	pr_ann "Initializing rootfs"
+
+	pr_inf "Installing kernel modules"
+	mkdir -p ${PREFIX}/lib/modules
+	cp -a /lib/modules/* ${PREFIX}/lib/modules/ &> /dev/null
+
+	pr_inf "Setting up root password to 'riscv'"
+	chroot ${PREFIX} /bin/sh -c 'echo "riscv\nriscv" | passwd'
+
+	pr_inf "Setting up DNS"
+	rm ${PREFIX}/etc/resolv.conf
+	echo "nameserver 10.0.2.3" > ${PREFIX}/etc/resolv.conf
+	# So that we can resolve while under installer
+	echo "nameserver 10.0.3.3" >> ${PREFIX}/etc/resolv.conf
+	# Fallback
+	echo "nameserver 1.1.1.1" >> ${PREFIX}/etc/resolv.conf
+	# Just in case user enables networkd/resolved later on
+	echo "DNS=10.0.2.3 10.0.3.3 1.1.1.1" >> ${PREFIX}/etc/systemd/resolved.conf
+
+	echo "" > ${PREFIX}/etc/fstab
+
+	# Things below may get stuck (but they can be fixed / done on reboot)
+
+	pr_inf "Preparing/configuring package installer"
+	# Mandb updates may get stuck during installs etc over NFS, so let's
+	# leave it out. The index will get re-created through a systemd timer anyway
+	# no need to do it on every package install (especialy not at this stage).
+	rm ${PREFIX}/var/lib/man-db/auto-update
+	# We don't need man pages / info / docs etc anyway, try to save space
+	# and bandwidth, all this stuff is available online anyway, and more up-to date,
+	# not to mention this runs under a host which probably has them already
+	echo path-exclude /usr/share/doc/* > ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	# we need to keep copyright files for legal reasons
+	echo path-include /usr/share/doc/*/copyright >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	echo path-exclude /usr/share/man/* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	echo path-exclude /usr/share/groff/* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	echo path-exclude /usr/share/info/* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	echo path-exclude /usr/share/lintian/* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	echo path-exclude /usr/share/linda/* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	# no need for localization, just keep en
+	echo path-exclude /usr/share/locale/* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+	echo path-include /usr/share/locale/en* >> ${PREFIX}/etc/dpkg/dpkg.cfg.d/01_cleaner
+
+	pr_inf "Cleaning up the mess..."
+	# Unfortunately dash doesn't support arrays, this is a mess to clean up more mess, mess all over the place...
+	run_in_chroot apt-get purge -y apport apparmor appstream bcache-tools bolt cloud-guest-utils cloud-init cloud-initramfs-copymods cloud-initramfs-dyn-netconf eatmydata finalrd friendly-recovery fwupd modemmanager netplan-generator netplan.io open-iscsi snapd squashfs-tools tcl thin-provisioning-tools ubuntu-pro-client ufw unattended-upgrades mdadm udisks2 lxd-* multipath-tools plymouth* rsyslog pollinate lvm2
+	run_in_chroot apt-get autoremove -y --purge
+	run_in_chroot apt-get clean
+	rm ${PREFIX}/etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+	# Cleanup any pre-installed man pages / docs, unused locales, translations etc
+	pr_inf "Cleaning up disk space..."
+	rm -rf ${PREFIX}/usr/share/man/*
+	rm -rf ${PREFIX}/var/cache/man/*
+	rm -rf ${PREFIX}/usr/share/info/*
+	run_in_chroot locale-gen --purge en_US.UTF-8
+	find ${PREFIX}/usr/share/doc -depth -type f ! -name copyright -print0 | xargs -0 rm &> /dev/null
+	find ${PREFIX}/usr/share/doc -empty -print0 | xargs -0 rm -rf &> /dev/null
+	find ${PREFIX}/usr/share/locale -mindepth 1 -maxdepth 1 ! -name en -print0 | xargs -0 rm -rf &> /dev/null
+
+	pr_inf "Updating package list"
+	run_in_chroot apt-get update
+
+	pr_inf "Configuring systemd-networkd (networking configured by kernel)"
+	echo -e "[Match]\nName=eth0\n\n[Network]\nDHCP=ipv4\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\n" > ${PREFIX}/etc/systemd/network/20-eth0.network
+	echo -e "[Match]\nName=eth1\n\n[Link]\nUnmanaged=yes\n" > ${PREFIX}/etc/systemd/network/10-ignore-eth1.network
+	run_in_chroot systemctl enable systemd-networkd
+
+	pr_inf "Disabling systemd-resolved (hardcoded namsesrvers by default)"
+	run_in_chroot systemctl disable systemd-resolved
+
+	pr_inf "Preventing systemd-udevd from modifying mac addresses asigned by kernel"
+	ln -s /dev/null ${PREFIX}/etc/systemd/network/99-default.link
+
+	pr_inf "Disabling sysstat service"
+	run_in_chroot systemctl disable sysstat
+
+	pr_inf "Enabling ssh daemon and generating host keys"
+	run_in_chroot dpkg-reconfigure openssh-server
+	run_in_chroot systemctl enable ssh
+
+	pr_inf "Downloading BSC RISC-V LLVM toolchain"
+	run_in_chroot wget https://admin.hca.bsc.es/epi/ftp/llvm-EPI-development-toolchain-native-latest.tar.bz2 -P /opt
+
+	pr_inf "Installing BSC RISC-V LLVM toolchain"
+	cd ${PREFIX}/opt
+	tar xvjf llvm-EPI-development-toolchain-native-latest.tar.bz2
+	chown -R root:root llvm-EPI-development-toolchain-native/
+	rm llvm-EPI-development-toolchain-native-latest.tar.bz2
+	echo "export PATH=\${PATH}:/opt/llvm-EPI-development-toolchain-native/bin" >> ${PREFIX}/etc/bash.bashrc
+	run_in_chroot apt install libatomic1
+	cd ${SAVED_PWD}
+
+	pr_inf "Installing dev environment packages"
+	run_in_chroot apt-get install -y build-essential device-tree-compiler bison flex mpich autoconf automake gperf libtool net-tools
+}
+
+function cleanup () {
+	sync;sync
+
+	pr_inf "Unmounting /proc"
+	for i in $(mount | grep ${PREFIX}/proc | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount ${PREFIX}/proc &> /dev/null
+
+	pr_inf "Unmounting /dev"
+	for i in $(mount | grep ${PREFIX}/dev | awk '{print $3}'); do
+                umount ${i} &> /dev/null
+        done
+	umount ${PREFIX}/dev &> /dev/null
+
+	pr_inf "Unmounting /sys"
+	for i in $(mount | grep ${PREFIX}/sys | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount ${PREFIX}/sys &> /dev/null
+
+	if [[ -d /run ]]; then
+		pr_inf "Unmounting /run"
+		for i in $(mount | grep ${PREFIX}/run | awk '{print $3}'); do
+			umount ${i} &> /dev/null
+		done
+		umount ${PREFIX}/run
+	fi
+}
+
+if [[ $# != 1 ]]; then
+	pr_wrn "Installation prefix not provided"
+	get_prefix_from_cmdline
+fi
+
+timesync
+download_initrootfs
+prepare_chroot
+initialize_rootfs
+cleanup
+
+pr_ann "Done"
+halt
+
