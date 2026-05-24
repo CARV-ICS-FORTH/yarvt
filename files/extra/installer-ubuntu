@@ -46,21 +46,31 @@ function timesync () {
 }
 
 function get_prefix_from_cmdline () {
+	local CMDLINE_DEV=$(cat /proc/cmdline | awk -F "installer_dev=" '{print $2}' | awk '{print $1}')
 	local CMDLINE_PREFIX=$(cat /proc/cmdline | awk -F "installer_prefix=" '{print $2}' | awk '{print $1}')
-	if [[ "${CMDLINE_PREFIX}" != "" ]]; then
+
+	# Bump up MTU and add default route via eth1 (DMA eth, user backend) for downloads
+	ip link set eth1 down
+	ip link set dev eth1 mtu 3626
+	ip link set eth1 up
+	ip route add default via 10.0.2.2
+
+	if [[ "${CMDLINE_DEV}" != "" ]]; then
+		pr_inf "Got installer device from kernel cmdline: ${CMDLINE_DEV}"
+		PREFIX=/mnt/target
+		mkdir -p ${PREFIX}
+
+		pr_inf "Mounting ${CMDLINE_DEV} at ${PREFIX}"
+		mount ${CMDLINE_DEV} ${PREFIX}
+		if [[ $? != 0 ]]; then
+			pr_err "Couldn't mount ${CMDLINE_DEV}"
+			exit 1
+		fi
+	elif [[ "${CMDLINE_PREFIX}" != "" ]]; then
 		pr_inf "Got installer prefix from kernel cmdline: ${CMDLINE_PREFIX}"
 		pr_inf "Mounting NFS export to /mnt/target"
 		PREFIX=/mnt/target
 		mkdir -p ${PREFIX}
-
-		# Increase MTU size as much as we can (our hw goes up to 4k)
-		# Note that whatever goes outside is limited by the host's MTU
-		# so this shouldn't be an issue when downloading stuff (we
-		# are using user-level networking, so no bridge etc).
-		ip link set eth1 down
-		ip link set dev eth1 mtu 3626
-		ip link set eth1 up
-		ip route add default via 10.0.2.2
 
 		mount -tnfs4 -orsize=8192,wsize=8192 10.0.2.2:${CMDLINE_PREFIX} ${PREFIX}
 		if [[ $? != 0 ]]; then
@@ -247,6 +257,10 @@ function cleanup () {
 		done
 		umount ${PREFIX}/run
 	fi
+
+	sync
+	pr_inf "Unmounting target"
+	umount ${PREFIX} &> /dev/null
 }
 
 if [[ $# != 1 ]]; then

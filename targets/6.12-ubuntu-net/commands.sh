@@ -6,13 +6,13 @@ function target_usage () {
 	pr_inf "\thelp/usage: Print this message"
 	pr_inf "\tbootstrap: (Re)Build unified image (osbi + Linux)"
 	pr_inf "\trun_on_qemu: Test unified image on QEMU"
-	pr_wrn "\t<arg> Rootfs path on host's NFS server"
+	pr_wrn "\t<arg> Rootfs: path to NFS-exported directory  OR  path to raw disk image file"
 	pr_inf "\tboot_node: Run unified image on QEMU, in a multi-instance scenario"
 	pr_wrn "\t<arg> Rootfs path on host's NFS server"
 	pr_wrn "\t<arg> Node ID (1 - 253)"
 	pr_inf "\trun_installer: Build and run the installer script on the rootfs"
 	pr_wrn "\t<arg> Distro to install: ubuntu / alpine"
-	pr_wrn "\t<arg> Rootfs path on host's NFS server"
+	pr_wrn "\t<arg> Rootfs: path to NFS-exported directory  OR  path to raw disk image file (created if absent)"
 }
 
 function target_env_check() {
@@ -67,23 +67,34 @@ function run_on_qemu () {
 	local BIOS=${OSBI_INSTALL_DIR}/fw_jump.elf
 
 	if [[ $# -lt 1 ]]; then
-		pr_err "Exported NFS path for rootfs on host is required"
+		pr_err "Rootfs argument required: NFS-exported directory or raw disk image file"
 		exit ${E_INVAL};
 	fi
 
 	if [[ ! -e ${1} ]]; then
-		pr_err "Provided path on host doesn't exist"
+		pr_err "Provided path doesn't exist"
 		exit ${E_INVAL};
 	fi
 
-	# Note: due to QEMU's networking code, where it is not possible to skip a nic and configure the next one, and the fact
-	# there is no null backend, we use the user backend for eth0, even though we won't use eth0 from the linux side.
-	# The reason is emaclite is too slow (and has significant packet loss) to run Linux with rootfs over NFS relialbly, dma
-	# based ethernet on the other hand is much better.
-	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 4G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
-		-nic user,id=hnet1,smb=${HOME} \
-		-kernel ${LINUX_INSTALL_DIR}/Image \
-		-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot:eth1:dhcp:: rw"
+	if [[ -f ${1} ]]; then
+		# Disk image mode: boot from raw image via virtio-blk
+		${QEMU} -nographic -machine eupilot-vec -smp 4 -m 4G \
+			-nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
+			-nic user,id=hnet1,smb=${HOME} \
+			-drive file=${1},format=raw,id=rootdisk \
+			-device virtio-blk-device,drive=rootdisk \
+			-kernel ${LINUX_INSTALL_DIR}/Image \
+			-append "root=/dev/vda1 rw rootwait"
+	else
+		# NFS mode: root over NFS via the fast DMA ethernet (eth1)
+		# Note: emaclite (eth0) is too slow/lossy for NFS; eth1 (DMA eth) is used instead.
+		# QEMU requires all NICs in order, so eth0 must still be declared even if unused.
+		${QEMU} -nographic -machine eupilot-vec -smp 4 -m 4G \
+			-nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
+			-nic user,id=hnet1,smb=${HOME} \
+			-kernel ${LINUX_INSTALL_DIR}/Image \
+			-append "nfsrootdebug root=/dev/nfs nfsroot=${1},vers=4,tcp ip=::::eupilot:eth1:dhcp:: rw"
+	fi
 
 	cd ${SAVED_PWD}
 }
@@ -161,22 +172,54 @@ function run_installer () {
 		exit ${E_INVAL};
 	fi
 
-	if [[ ! -e ${2} ]]; then
-		pr_err "Provided path on host doesn't exist"
-		exit ${E_INVAL};
-	fi
-
-	if ! [[ -d ${ROOTFS_INSTALL_DIR} ]]; then
-		pr_inf "First time this runs, build rootfs for installer"
+	if ! [[ -d ${ROOTFS_INSTALL_DIR} ]] || \
+	   [[ "${SCRIPT_PATH}/files/extra/installer-ubuntu" -nt "${ROOTFS_INSTALL_DIR}/initramfs.img" ]]; then
+		pr_inf "Building/rebuilding rootfs for installer"
 		NO_NETWORK=1
 		build_rootfs
 	fi
 
-	${QEMU} -nographic -machine eupilot-vec -smp 4 -m 8G -nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
-		-nic user,id=hnet1,smb=${HOME} \
-		-kernel ${LINUX_INSTALL_DIR}/Image \
-		-initrd ${ROOTFS_INSTALL_DIR}/initramfs.img \
-		-append "installer_prefix=${2} installer=${1} ip=::::eupilot:eth1:dhcp::"
+	if [[ -d ${2} ]]; then
+		# NFS mode: install into an NFS-exported directory
+		${QEMU} -nographic -machine eupilot-vec -smp 4 -m 8G \
+			-nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
+			-nic user,id=hnet1,smb=${HOME} \
+			-kernel ${LINUX_INSTALL_DIR}/Image \
+			-initrd ${ROOTFS_INSTALL_DIR}/initramfs.img \
+			-append "installer_prefix=${2} installer=${1} ip=::::eupilot:eth1:dhcp::"
+	else
+		# Disk image mode: install into a raw partitioned image via virtio-blk
+		if [[ ! -e ${2} ]]; then
+			pr_inf "Creating 16G raw disk image at ${2}..."
+			fallocate -l 16G ${2}
+			if [[ $? -ne 0 ]]; then
+				pr_err "Failed to create disk image"
+				exit ${E_INVAL};
+			fi
+		fi
+		pr_inf "Partitioning disk image..."
+		sgdisk -n 1:2048:0 -t 1:8300 ${2}
+		if [[ $? -ne 0 ]]; then
+			pr_err "Failed to partition disk image"
+			exit ${E_INVAL};
+		fi
+		pr_inf "Formatting partition as ext4..."
+		local _fsectors=$(( $(stat -c%s ${2}) / 512 ))
+		local _fblocks=$(( (_fsectors - 2081) / 8 ))
+		mkfs.ext4 -F -E offset=$((2048 * 512)) ${2} ${_fblocks}
+		if [[ $? -ne 0 ]]; then
+			pr_err "Failed to format partition"
+			exit ${E_INVAL};
+		fi
+		${QEMU} -nographic -machine eupilot-vec -smp 4 -m 8G \
+			-nic user,model=xlnx.xps-ethernetlite,id=hnet0,net=10.0.3.0/24 \
+			-nic user,id=hnet1,smb=${HOME} \
+			-drive file=${2},format=raw,id=rootdisk \
+			-device virtio-blk-device,drive=rootdisk \
+			-kernel ${LINUX_INSTALL_DIR}/Image \
+			-initrd ${ROOTFS_INSTALL_DIR}/initramfs.img \
+			-append "installer_dev=/dev/vda1 installer=${1} ip=::::eupilot:eth1:dhcp::"
+	fi
 
 	cd ${SAVED_PWD}
 }

@@ -85,10 +85,16 @@ Note that 10.0.2.4 is a virtual endpoint emulated by QEMU's user network backend
 The current machine model has two ethernet interfaces, eth0 is an emaclite interface and eth1 is a dma-based ethernet NIC that matches FORTH's implementation in hw.
 
 
-Step 3: Prepare and export a folder on the host for the rootfs
-==============================================================
+Step 3: Prepare a rootfs — NFS export or raw disk image
+========================================================
 
-Since our platform doesn't include storage, the only way to boot a full-blown linux distro is to mount its rootfs over NFS. I tried to make this work without root privileges, using cifs instead of NFS but the rootfs over cifs support in the linux kernel doesn't work well with QEMU's user backend approach, so all commands in this step need to be executed with root privileges unfortunately (but only once). Let's start by installing nfs tools for running the server:
+There are two ways to provide a rootfs to the ubuntu-net target:
+
+**Option A — Raw disk image (simpler, no root required for setup):**
+yarvt can create and manage a raw disk image file for you. Skip ahead to Step 4 and pass a file path (e.g. `/home/user/riscv64.raw`) instead of a directory. yarvt will create a 16G image, partition it, and format it automatically.
+
+**Option B — NFS export (needed for multi-node setups, Step 6+):**
+The NFS approach mounts the rootfs over the network and is required for the multi-instance boot_node workflow. All commands in this step need to be executed with root privileges (but only once). Let's start by installing nfs tools for running the server:
 
 ```
 apt-get install nfs-kernel-server
@@ -122,30 +128,39 @@ The first step is to bootstrap the ubuntu-net profile, since we need the kernel 
 ./yarvt 6.12-ubuntu-net bootstrap
 ```
 
-When the process is done, choose which distro to install in the exported NFS folder using the run_installer command of that profile:
+When the process is done, run the installer for your chosen distro. Pass either an NFS-exported directory or a path to a raw disk image file (created automatically if it doesn't exist):
 
 ```
+# Install into a raw disk image (no NFS needed):
+./yarvt 6.12-ubuntu-net run_installer ubuntu /home/user/riscv64.raw
+or
+./yarvt 6.12-ubuntu-net run_installer alpine /home/user/riscv64.raw
+
+# Install into an NFS-exported directory (see Step 3, Option B):
 ./yarvt 6.12-ubuntu-net run_installer ubuntu /mnt/riscv64-rootfs/
 or
 ./yarvt 6.12-ubuntu-net run_installer alpine /mnt/riscv64-rootfs/
 ```
 
-This will build a small initramfs (as in step 2), that includes the installation scripts, boot QEMU, and run the installation scripts inside QEMU, with the NFS export mounted.
-When the process is done you'll have a full RISC-V ubuntu/alpine distro installed in your exported folder.
+This will build a small initramfs (as in step 2), that includes the installation scripts, boot QEMU, and run the installation scripts inside QEMU.
+When the process is done you'll have a full RISC-V ubuntu/alpine distro installed in the target location.
 
 
 Step 5: Booting a single instance of the platform, running ubuntu/alpine
 ===============================================================
 
-Time to boot the ubuntu-net target, with the rootfs we created above:
+Time to boot the ubuntu-net target with the rootfs created in Step 4. Pass the same path you used for installation — either a raw disk image or an NFS-exported directory:
 
 ```
+# Boot from raw disk image:
+./yarvt 6.12-ubuntu-net run_on_qemu /home/user/riscv64.raw
+
+# Boot from NFS-exported directory:
 ./yarvt 6.12-ubuntu-net run_on_qemu /mnt/riscv64-rootfs/
 ```
 
-Note that this would mount the rootfs read-write, allowing you to perform maintenance tasks etc.
 The root password set by the installation script is 'riscv' for convenience.
-Don't forget to clean things up after you are done, so that the rootfs can also be mounted as read-only for the next step.
+When booting from NFS the rootfs is mounted read-write, which is useful for maintenance; don't forget to clean things up after you are done, so that the rootfs can also be mounted as read-only for the next step.
 
 Networking in this case is also provided by QEMU's user backend, so check Step 2 for details, the only difference here is that eth1 is used instead of eth0, since eth1 is the dma-based ethernet and is much better/faster for mounting rootfs over NFS.
 The emaclite nic is connected to a dummy network with a subnet that goes nowhere due to a limitation in QEMU (we need to initialize eth0 in order to initialize eth1).

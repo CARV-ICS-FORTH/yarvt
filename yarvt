@@ -862,6 +862,7 @@ function build_qemu () {
 	make clean &>> ${LOGFILE}
 	make distclean &>> ${LOGFILE}
 	./configure --target-list=${TARGET_LIST} --disable-docs \
+		    --disable-werror \
 		    --prefix="${INSTALL_DIR}" &>> ${LOGFILE}
 	if [[ $? != 0 ]]; then
 		die "\tConfig failed, check out ${LOGFILE}..." ${E_CONFIG}

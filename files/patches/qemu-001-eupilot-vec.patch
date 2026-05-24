@@ -1,9 +1,13 @@
-commit 8e299157c07fd0bf57635f9cd0b6a41bc06352b8
-Author: Nick Kossifidis <mick@ics.forth.gr>
-Date:   Tue Oct 29 23:26:37 2024 +0200
+Subject: [PATCH] riscv: Add eupilot-vec machine
 
-    Add eupilot-vec machine, xxvnet_carv nic and a fix for plic/emaclite
+Add the eupilot-vec QEMU machine with support for virtio-mmio block
+device, DMA-based ethernet, and the CARV xxvnet NIC.
 
+Also fixes a sign-extension issue in xilinx_ethlite.c that caused packet
+loss at the physical addresses used by this machine.
+
+Signed-off-by: Nick Kossifidis <mickflemm@gmail.com>
+---
 diff --git a/configs/devices/riscv64-softmmu/default.mak b/configs/devices/riscv64-softmmu/default.mak
 index bc69301..e332fb0 100644
 --- a/configs/devices/riscv64-softmmu/default.mak
@@ -1100,10 +1104,10 @@ index 0000000..6fd25e9
 +type_init(xxvnet_carv_register_types)
 \ No newline at end of file
 diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
-index b6a5eb4..7a8caf0 100644
+index b6a5eb4..7d8fdab 100644
 --- a/hw/riscv/Kconfig
 +++ b/hw/riscv/Kconfig
-@@ -46,6 +46,15 @@ config RISCV_VIRT
+@@ -46,6 +46,16 @@ config RISCV_VIRT
      select PLATFORM_BUS
      select ACPI
  
@@ -1115,10 +1119,26 @@ index b6a5eb4..7a8caf0 100644
 +    select SIFIVE_PLIC
 +    select XILINX_ETHLITE
 +    select XXVNET_CARV
++    select VIRTIO_MMIO
 +
  config SHAKTI_C
      bool
      select RISCV_ACLINT
+diff --git a/hw/riscv/boot.c b/hw/riscv/boot.c
+index 0ffca05..0547895 100644
+--- a/hw/riscv/boot.c
++++ b/hw/riscv/boot.c
+@@ -208,8 +208,8 @@ static void riscv_load_initrd(MachineState *machine, uint64_t kernel_entry)
+     /* Some RISC-V machines (e.g. opentitan) don't have a fdt. */
+     if (fdt) {
+         end = start + size;
+-        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-start", start);
+-        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-end", end);
++        qemu_fdt_setprop_u64(fdt, "/chosen", "linux,initrd-start", start);
++        qemu_fdt_setprop_u64(fdt, "/chosen", "linux,initrd-end", end);
+     }
+ }
+ 
 diff --git a/hw/riscv/meson.build b/hw/riscv/meson.build
 index 2f7ee81..ce032bd 100644
 --- a/hw/riscv/meson.build
@@ -1133,10 +1153,10 @@ index 2f7ee81..ce032bd 100644
  riscv_ss.add(when: 'CONFIG_SIFIVE_U', if_true: files('sifive_u.c'))
 diff --git a/hw/riscv/sdv3.c b/hw/riscv/sdv3.c
 new file mode 100644
-index 0000000..58b0932
+index 0000000..c62809c
 --- /dev/null
 +++ b/hw/riscv/sdv3.c
-@@ -0,0 +1,701 @@
+@@ -0,0 +1,740 @@
 +/*
 + * QEMU SDV3 board
 + *
@@ -1186,6 +1206,7 @@ index 0000000..58b0932
 +	SDV3_UART,
 +	SDV3_EMACLITE,
 +	SDV3_DMAETH,
++	SDV3_VIRTIO,
 +	SDV3_FLASH,	/* Doesn't exist in hw, we use it for testing bare metal apps on qemu */
 +	SDV3_DRAM
 +};
@@ -1195,7 +1216,8 @@ index 0000000..58b0932
 +	SDV3_UART_IRQ		= 1,
 +	SDV3_EMACLITE_IRQ	= 2,
 +	SDV3_DMAETH_TX_IRQ	= 3,
-+	SDV3_DMAETH_RX_IRQ	= 4
++	SDV3_DMAETH_RX_IRQ	= 4,
++	SDV3_VIRTIO_IRQ		= 5
 +};
 +
 +/* Helper macros */
@@ -1239,6 +1261,7 @@ index 0000000..58b0932
 +	[SDV3_UART]	= { 0x40010000000,	0x1000 },
 +	[SDV3_EMACLITE]	= { 0x40011000000,	0x3000 },
 +	[SDV3_DMAETH]	= { 0x40011010000,	0x1000 },
++	[SDV3_VIRTIO]	= { 0x40012000000,	0x200 },
 +	[SDV3_FLASH]	= { 0x800000000000,	0x200000 },
 +	[SDV3_DRAM]	= { 0x800000400000,	0x0 },
 +};
@@ -1568,6 +1591,26 @@ index 0000000..58b0932
 +	g_free(name);
 +}
 +
++static void create_fdt_virtio(Sdv3State *st)
++{
++	MachineState *ms = MACHINE(st);
++	uint64_t virtio_addr = sdv3_memmap[SDV3_VIRTIO].base;
++	uint64_t virtio_size = sdv3_memmap[SDV3_VIRTIO].size;
++	int hart_count = st->cpus.num_harts;
++	uint32_t plic_phandle = hart_count + 1;
++	char *name;
++
++	name = g_strdup_printf("/soc/virtio_mmio@%" PRIx64, virtio_addr);
++	qemu_fdt_add_subnode(ms->fdt, name);
++	qemu_fdt_setprop_string(ms->fdt, name, "compatible", "virtio,mmio");
++	qemu_fdt_setprop_cells(ms->fdt, name, "reg",
++			       virtio_addr >> 32, virtio_addr,
++			       virtio_size >> 32, virtio_size);
++	qemu_fdt_setprop_cell(ms->fdt, name, "interrupt-parent", plic_phandle);
++	qemu_fdt_setprop_cell(ms->fdt, name, "interrupts", SDV3_VIRTIO_IRQ);
++	g_free(name);
++}
++
 +static void create_fdt(Sdv3State *st)
 +{
 +	MachineState *ms = MACHINE(st);
@@ -1619,6 +1662,9 @@ index 0000000..58b0932
 +
 +	/* Populate /soc/ethdma, also creates /aliases/ethernet1 */
 +	create_fdt_ethdma(st);
++
++	/* Populate /soc/virtio_mmio */
++	create_fdt_virtio(st);
 +
 +	/* Populate /soc/test, /reboot, /poweroff */
 +	create_fdt_test(st);
@@ -1756,6 +1802,19 @@ index 0000000..58b0932
 +	memory_region_add_subregion(system_memory, sdv3_memmap[SDV3_DMAETH].base, mr);
 +	error_report("dmaeth at 0x%016lx\n", mr->addr);
 +
++	/* Register virtio-mmio transport slot for block device (modern v2,
++	 * force-legacy defaults to true in this build but legacy mode rejects
++	 * RAM above 16TB which SDV3's DRAM base exceeds) */
++	{
++		DeviceState *vmmio = qdev_new("virtio-mmio");
++		qdev_prop_set_bit(vmmio, "force-legacy", false);
++		sysbus_realize_and_unref(SYS_BUS_DEVICE(vmmio), &error_fatal);
++		sysbus_mmio_map(SYS_BUS_DEVICE(vmmio), 0,
++				sdv3_memmap[SDV3_VIRTIO].base);
++		sysbus_connect_irq(SYS_BUS_DEVICE(vmmio), 0,
++				   qdev_get_gpio_in(st->plic, SDV3_VIRTIO_IRQ));
++	}
++
 +	/* Register pflash */
 +	pflash_cfi01_legacy_drive(st->pflash, drive_get(IF_PFLASH, 0, 0));
 +	dev = DEVICE(st->pflash);
@@ -1851,7 +1910,7 @@ index 91b3361..1d97d95 100644
  OBJECT_DECLARE_CPU_TYPE(RISCVCPU, RISCVCPUClass, RISCV_CPU)
  
 diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
-index 77cb59b..b0ca3cd 100644
+index eb0e856..1563069 100644
 --- a/target/riscv/cpu.c
 +++ b/target/riscv/cpu.c
 @@ -535,6 +535,41 @@ static void rv64_veyron_v1_cpu_init(Object *obj)
@@ -1896,7 +1955,7 @@ index 77cb59b..b0ca3cd 100644
  static void rv128_base_cpu_init(Object *obj)
  {
      if (qemu_tcg_mttcg_enabled()) {
-@@ -1810,6 +1845,7 @@ static const TypeInfo riscv_cpu_type_infos[] = {
+@@ -1811,6 +1846,7 @@ static const TypeInfo riscv_cpu_type_infos[] = {
      DEFINE_CPU(TYPE_RISCV_CPU_SHAKTI_C,         rv64_sifive_u_cpu_init),
      DEFINE_CPU(TYPE_RISCV_CPU_THEAD_C906,       rv64_thead_c906_cpu_init),
      DEFINE_CPU(TYPE_RISCV_CPU_VEYRON_V1,        rv64_veyron_v1_cpu_init),
@@ -1904,18 +1963,3 @@ index 77cb59b..b0ca3cd 100644
      DEFINE_DYNAMIC_CPU(TYPE_RISCV_CPU_BASE128,  rv128_base_cpu_init),
  #endif
  };
-diff --git a/hw/riscv/boot.c b/hw/riscv/boot.c
-index 0ffca05..0547895 100644
---- a/hw/riscv/boot.c
-+++ b/hw/riscv/boot.c
-@@ -208,8 +208,8 @@ static void riscv_load_initrd(MachineState *machine, uint64_t kernel_entry)
-     /* Some RISC-V machines (e.g. opentitan) don't have a fdt. */
-     if (fdt) {
-         end = start + size;
--        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-start", start);
--        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-end", end);
-+        qemu_fdt_setprop_u64(fdt, "/chosen", "linux,initrd-start", start);
-+        qemu_fdt_setprop_u64(fdt, "/chosen", "linux,initrd-end", end);
-     }
- }
- 
