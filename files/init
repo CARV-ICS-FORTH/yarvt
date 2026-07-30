@@ -10,6 +10,16 @@ mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
 # Disable kernel log output on console
 dmesg -n1
 
+# If there's an NVMe controller (PCI class 0108) but the driver didn't bind it
+# (e.g. it's built as a module and isn't loaded yet), load it so /dev/nvme*
+# shows up before we need it.
+if lspci | grep -q "Class 0108"; then
+	if ! ls /dev/nvme* &> /dev/null; then
+		modprobe nvme_core &> /dev/null
+		modprobe nvme &> /dev/null
+	fi
+fi
+
 # Populate the remaining stuff for rootfs
 mkdir /tmp
 mkdir -p /var/run

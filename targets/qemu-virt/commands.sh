@@ -6,8 +6,10 @@ function target_usage () {
 	pr_inf "\tbuild_osbi: (Re)Build OpenSBI"
 	pr_inf "\tbuild_linux: (Re)Build a defconfig RISC-V Linux kernel"
 	pr_inf "\tbuild_rootfs: (Re)Build a minimal rootfs on initramfs"
-	pr_inf "\trun_linux32: Run a 32bit QEMU instance with osbi+linux+initramfs"
-	pr_inf "\trun_linux64: Run a 64bit QEMU instance with osbi+linux+initramfs"
+	pr_inf "\trun_linux32 [disk]: Run a 32bit QEMU instance with osbi+linux+initramfs"
+	pr_inf "\trun_linux64 [disk]: Run a 64bit QEMU instance with osbi+linux+initramfs"
+	pr_wrn "\t[disk]: Optional path to a raw disk image exposed to the guest as an"
+	pr_wrn "\t        NVMe device. Created with truncate if it doesn't exist."
 }
 
 function target_env_check() {
@@ -55,6 +57,9 @@ function target_bootstrap () {
 }
 
 function run_linux () {
+	local DISK=${1}
+	local NVME_SIZE=8G
+	local NVME_ARGS=""
 	local SAVED_PWD=${PWD}
 	local QEMU_INSTALL_DIR=${BINDIR}/riscv-qemu
 	local OSBI_INSTALL_DIR=${WORKDIR}/${BASE_ISA}/riscv-opensbi
@@ -64,12 +69,35 @@ function run_linux () {
 	local QEMU=${QEMU_INSTALL_DIR}/bin/qemu-system-riscv${BASE_ISA_XLEN}
 	local BIOS=${OSBI_INSTALL_DIR}/fw_jump.elf
 
+	# Optionally back an NVMe device with a raw disk image. If the image
+	# doesn't exist (and the path isn't a directory) create it with truncate.
+	if [[ "${DISK}" != "" ]]; then
+		if [[ -f "${DISK}" ]]; then
+			pr_inf "Using existing disk image ${DISK} as an NVMe device"
+		elif [[ "${DISK}" != */ && ! -e "${DISK}" ]]; then
+			pr_inf "Creating ${NVME_SIZE} disk image ${DISK}..."
+			truncate -s ${NVME_SIZE} "${DISK}"
+			if [[ $? != 0 ]]; then
+				pr_err "Couldn't create disk image ${DISK}"
+				KEEP_LOGS=0
+				exit -1
+			fi
+		else
+			pr_err "'${DISK}' is not a valid disk image path"
+			KEEP_LOGS=0
+			exit -1
+		fi
+		NVME_ARGS="-drive file=${DISK},if=none,id=nvm0,format=raw"
+		NVME_ARGS="${NVME_ARGS} -device nvme,serial=YRVT0000000000000001,drive=nvm0"
+	fi
+
 	${QEMU} -nographic -machine virt -smp 2 -m 1G -s \
 		-netdev user,id=unet,hostfwd=tcp::2222-:22,hostname=riscv \
 		-device virtio-net-device,netdev=unet \
 		-net user \
 		-object rng-random,filename=/dev/urandom,id=rng0 \
 		-device virtio-rng-device,rng=rng0 \
+		${NVME_ARGS} \
 		-bios ${BIOS} \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
 		-initrd ${ROOTFS_INSTALL_DIR}/initramfs.img
@@ -80,10 +108,10 @@ function run_linux () {
 
 function run_linux32 () {
 	BASE_ISA=RV32I
-	run_linux
+	run_linux "${1}"
 }
 
 function run_linux64 () {
 	BASE_ISA=RV64I
-	run_linux
+	run_linux "${1}"
 }
