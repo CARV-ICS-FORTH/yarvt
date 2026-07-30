@@ -46,6 +46,7 @@ E_INSTALL=6
 E_NOTC=7
 E_NOKERNEL=8
 E_SIGINT=9
+E_FETCH=10
 
 ####################
 # GIT REPOSITORIES #
@@ -58,19 +59,19 @@ OSBI_GITURL=https://github.com/riscv-software-src/opensbi.git
 OSBI_GITBRANCH=""
 
 QEMU_GITURL=https://gitlab.com/qemu-project/qemu.git
-QEMU_GITBRANCH="stable-10.1"
+QEMU_GITBRANCH="stable-11.0"
 
-BBOX_GITURL=https://git.busybox.net/busybox.git
-BBOX_GITBRANCH="1_36_stable"
+BBOX_TARURL=https://busybox.net/downloads/busybox-1.38.0.tar.bz2
+BBOX_SIGURL=https://busybox.net/downloads/busybox-1.38.0.tar.bz2.sig
 
 DBEAR_GITURL=https://github.com/mkj/dropbear.git
-DBEAR_GITBRANCH="DROPBEAR_2025.89"
+DBEAR_GITBRANCH="DROPBEAR_2026.94"
 
 IPERF3_GITURL=https://github.com/esnet/iperf.git
-IPERF3_GITBRANCH="3.20"
+IPERF3_GITBRANCH="3.21"
 
 RVGTOOLCHAIN_GITURL=https://github.com/riscv-collab/riscv-gnu-toolchain.git
-RVGTOOLCHAIN_GITBRANCH="2026.01.09"
+RVGTOOLCHAIN_GITBRANCH="2026.07.15"
 RVGTOOLCHAIN_GITCOMMIT=""
 RVGTOOLCHAIN_RELURL=https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/
 
@@ -205,6 +206,145 @@ function get_git_sources() {
 	else
 		git_clone "${1}" "${2}"
 	fi
+}
+
+function archived_sources_cleanup () {
+	# Restore extracted sources to their pristine state, just like
+	# git_cleanup does for git-based ones. We snapshot the freshly
+	# unpacked tree in git (see get_archived_sources) exactly so that we
+	# can undo the in-place edits we do later (e.g. busybox's Makefile).
+	# ${1} is the source directory.
+	cd "${1}"
+	git checkout -f &>> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		die "Restoring ${1} failed, check out ${LOGFILE}" ${E_GIT}
+	fi
+
+	# Clean up untracked files (generated configs, build artifacts, etc)
+	for i in $(git status -u -s | awk '{print $2}'); do
+		rm -f "${i}" &>> ${LOGFILE}
+	done
+	cd "${SAVED_PWD}"
+}
+
+function get_archived_sources() {
+	local ARCHIVE_URL=${1}
+	local SIG_URL=${2}
+	local SRC_DIR=${3}
+	local WORK_DIR=$(dirname "${SRC_DIR}")
+	local ARCHIVE=$(basename "${ARCHIVE_URL}")
+	local SIG=""
+	local GPG_STATUS=""
+	local KEYID=""
+	local EXTRACT_DIR=""
+	local ENTRIES=()
+
+	if [[ "${ARCHIVE_URL}" == "" || "${SRC_DIR}" == "" ]]; then
+		die "get_archived_sources: missing arguments" ${E_INVAL}
+	fi
+
+	# Handle already-present sources the same way get_git_sources does
+	if [[ -d "${SRC_DIR}" ]]; then
+		if [[ ${CLEAR_SOURCES} == 1 ]]; then
+			pr_dbg "Cleaning up ${SRC_DIR}..."
+			rm -rf "${SRC_DIR}" &>> ${LOGFILE}
+		elif [[ ${REUSE_SOURCES} == 1 ]]; then
+			return 0
+		elif [[ -d "${SRC_DIR}"/.git ]]; then
+			# Restore our pristine snapshot and we're done
+			archived_sources_cleanup "${SRC_DIR}"
+			return 0
+		else
+			# A tree without our snapshot (leftover from an older run
+			# or a partial extraction) can't be restored, refetch it
+			pr_dbg "No snapshot in ${SRC_DIR}, refetching..."
+			rm -rf "${SRC_DIR}" &>> ${LOGFILE}
+		fi
+	fi
+
+	mkdir -p "${WORK_DIR}" &>> ${LOGFILE}
+
+	pr_dbg "Downloading ${ARCHIVE} to ${WORK_DIR}..."
+	wget -O "${WORK_DIR}/${ARCHIVE}" "${ARCHIVE_URL}" &>> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		die "Couldn't download ${ARCHIVE_URL}" ${E_FETCH}
+	fi
+
+	# Verify the detached signature if one was provided
+	if [[ "${SIG_URL}" != "" ]]; then
+		SIG=$(basename "${SIG_URL}")
+		pr_dbg "Downloading signature ${SIG}..."
+		wget -O "${WORK_DIR}/${SIG}" "${SIG_URL}" &>> ${LOGFILE}
+		if [[ $? != 0 ]]; then
+			rm -f "${WORK_DIR}/${ARCHIVE}" &>> ${LOGFILE}
+			die "Couldn't download ${SIG_URL}" ${E_FETCH}
+		fi
+
+		pr_inf "Verifying signature of ${ARCHIVE}..."
+		GPG_STATUS=$(gpg --status-fd 1 --verify \
+			     "${WORK_DIR}/${SIG}" "${WORK_DIR}/${ARCHIVE}" 2>> ${LOGFILE})
+		echo "${GPG_STATUS}" >> ${LOGFILE}
+
+		# If we don't have the signer's public key grab it from a
+		# keyserver and verify again
+		if ! echo "${GPG_STATUS}" | grep -q "GOODSIG"; then
+			KEYID=$(echo "${GPG_STATUS}" | grep "NO_PUBKEY" | awk '{print $NF}')
+			if [[ "${KEYID}" != "" ]]; then
+				pr_wrn "Signer's public key not present, fetching ${KEYID}..."
+				gpg --recv-keys "${KEYID}" &>> ${LOGFILE}
+				GPG_STATUS=$(gpg --status-fd 1 --verify \
+					     "${WORK_DIR}/${SIG}" "${WORK_DIR}/${ARCHIVE}" 2>> ${LOGFILE})
+				echo "${GPG_STATUS}" >> ${LOGFILE}
+			fi
+		fi
+
+		rm -f "${WORK_DIR}/${SIG}" &>> ${LOGFILE}
+		if ! echo "${GPG_STATUS}" | grep -q "GOODSIG"; then
+			rm -f "${WORK_DIR}/${ARCHIVE}" &>> ${LOGFILE}
+			die "Signature verification failed for ${ARCHIVE}" ${E_FETCH}
+		fi
+	fi
+
+	pr_dbg "Unpacking ${ARCHIVE}..."
+	EXTRACT_DIR=$(mktemp -d "${WORK_DIR}/.archive.XXXXXX")
+	case "${ARCHIVE}" in
+		*.tar.bz2 | *.tbz2)
+			tar xjf "${WORK_DIR}/${ARCHIVE}" -C "${EXTRACT_DIR}" &>> ${LOGFILE} ;;
+		*.tar.gz | *.tgz)
+			tar xzf "${WORK_DIR}/${ARCHIVE}" -C "${EXTRACT_DIR}" &>> ${LOGFILE} ;;
+		*.tar.xz | *.txz)
+			tar xJf "${WORK_DIR}/${ARCHIVE}" -C "${EXTRACT_DIR}" &>> ${LOGFILE} ;;
+		*.tar.zst)
+			tar --zstd -xf "${WORK_DIR}/${ARCHIVE}" -C "${EXTRACT_DIR}" &>> ${LOGFILE} ;;
+		*)
+			# Let tar autodetect the compression
+			tar xf "${WORK_DIR}/${ARCHIVE}" -C "${EXTRACT_DIR}" &>> ${LOGFILE} ;;
+	esac
+	if [[ $? != 0 ]]; then
+		rm -rf "${WORK_DIR}/${ARCHIVE}" "${EXTRACT_DIR}" &>> ${LOGFILE}
+		die "Couldn't unpack ${ARCHIVE}" ${E_FETCH}
+	fi
+	# Get rid of the downloaded archive
+	rm -f "${WORK_DIR}/${ARCHIVE}" &>> ${LOGFILE}
+
+	# Tarballs usually wrap everything in a single top-level directory;
+	# strip it so ${SRC_DIR} holds the sources directly, like a checkout.
+	ENTRIES=("${EXTRACT_DIR}"/*)
+	if [[ ${#ENTRIES[@]} == 1 && -d "${ENTRIES[0]}" ]]; then
+		mv "${ENTRIES[0]}" "${SRC_DIR}" &>> ${LOGFILE}
+		rmdir "${EXTRACT_DIR}" &>> ${LOGFILE}
+	else
+		mv "${EXTRACT_DIR}" "${SRC_DIR}" &>> ${LOGFILE}
+	fi
+
+	# Snapshot the pristine sources in git so later runs can restore them
+	# through archived_sources_cleanup after we've patched files in place.
+	cd "${SRC_DIR}"
+	git init -q &>> ${LOGFILE}
+	git add -A &>> ${LOGFILE}
+	git -c user.name='yarvt' -c user.email='yarvt@localhost' \
+	    commit -q -m "pristine ${ARCHIVE}" &>> ${LOGFILE}
+	cd "${SAVED_PWD}"
 }
 
 function get_git_submodule () {
@@ -443,7 +583,6 @@ function deduplicate_files() {
 function build_busybox () {
 	local LOGFILE=${TMP_DIR}/bb.log
 	local SOURCES_DIR="${SOURCES}"/busybox
-	local GITURL=${BBOX_GITURL}
 	local INSTALL_DIR="${WORKDIR}"/${BASE_ISA}/rootfs
 	local BASE_ISA_XLEN=$(echo ${BASE_ISA} | tr -d [:alpha:])
 	local TC_INSTALL_DIR=$(get_tc_path musl ${BASE_ISA_XLEN})
@@ -469,10 +608,10 @@ function build_busybox () {
 		die "Toolchain not present, did you run bootstrap ?" ${E_NOTC}
 	fi
 
-	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
+	local PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
-	pr_inf "Checking out BusyBox sources..."
-	get_git_sources ${BBOX_GITBRANCH}
+	pr_inf "Fetching BusyBox sources..."
+	get_archived_sources "${BBOX_TARURL}" "${BBOX_SIGURL}" "${SOURCES_DIR}"
 
 	pr_inf "Configuring BusyBox..."
 	cd "${SOURCES_DIR}"
@@ -519,7 +658,7 @@ function build_dropbear () {
 	local MARCH=rv${BASE_ISA_XLEN}imafdc
 	local MABI=""
 
-	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
+	local PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
 	# There is already a binary there, if it's for the same BASE_ISA_XLEN
 	# as the image we are building just re-use it instead of recompiling it
@@ -595,7 +734,7 @@ function build_iperf () {
 	local MARCH=rv${BASE_ISA_XLEN}imafdc
 	local MABI=""
 
-	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
+	local PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
 	# There is already a binary there, if it's for the same BASE_ISA_XLEN
 	# as the image we are building just re-use it instead of recompiling it
@@ -748,7 +887,24 @@ function build_toolchain () {
 		die "\tConfig failed, check out ${LOGFILE}..." ${E_CONFIG}
 	fi
 
-	rm -rf "${INSTALL_DIR}" &>> ${LOGFILE}
+	# gprofng's libcollector is cross-compiled against the target libc headers,
+	# and recent glibc's _Generic-based macros break its build. That kills the
+	# Linux binutils/gdb build (and the target 'as' with it), cascading into a
+	# bogus stage1 libgcc "cannot compute suffix of object files". There's no
+	# --disable-gprofng knob in the toolchain and we don't need gprofng in a
+	# cross toolchain, so inject it into every binutils/gdb configure.
+	# TODO: Fix this upstream (for now CI uses ubuntu 22/24 so it doesn't hit this
+	# issue).
+	sed -i 's/--disable-gdb \\/--disable-gdb --disable-gprofng \\/' Makefile
+	sed -i 's/--enable-gdb \\/--enable-gdb --disable-gprofng \\/' Makefile
+
+	# The toolchain tracks completed steps with stamps/ and builds in build-*
+	# scratch dirs, both of which live in SOURCES_DIR and persist across runs.
+	# Since we wipe INSTALL_DIR (which holds the sysroot) for a clean install,
+	# we must clear those too: otherwise a re-run skips steps whose output we
+	# just deleted (e.g. installing the kernel headers into the sysroot),
+	# leaving an inconsistent tree and a confusing mid-build failure.
+	rm -rf "${INSTALL_DIR}" "${SOURCES_DIR}"/stamps "${SOURCES_DIR}"/build-* &>> ${LOGFILE}
 
 	pr_inf "Building ${TC_TYPE}-based toolchain..."
 	make -j ${NUM_JOBS} ${TC_MKTARGET} &>> ${LOGFILE}
@@ -767,14 +923,15 @@ function build_toolchain () {
 }
 
 function fetch_toolchain () {
-	local LOGFILE=${TMP_DIR}/toolchain.log
+	# Per-job logfile so parallel fetches in bootstrap_fast don't interleave
+	local LOGFILE=${TMP_DIR}/toolchain-${1}${2}.log
 	local IFS=$'\n'
 	local TC_TYPE=${1}
 	local BASE_ISA_XLEN=${2}
 	local RELURL=${RVGTOOLCHAIN_GITURL%.git}/releases/download
 	local TAGS=()
 	local TUPLE=""
-	local OS_VERSION="ubuntu-22.04"
+	local OS_VERSION="ubuntu-24.04"
 	local FILENAME=""
 	local DOWNLOAD_URL=""
 	local HTTP_CODE=""
@@ -893,7 +1050,7 @@ function build_linux () {
 	local CC_PREFIX=$(get_tc_tuple glibc ${BASE_ISA_XLEN})-
 	local CONFIG_FRAGMENTS=""
 
-	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
+	local PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
 	if [[ ${KERNEL_EMBED_INITRAMFS} == 1 ]]; then
 		pr_ann "RISC-V Linux kernel for ${TARGET}/${BASE_ISA} with built-in initramfs"
@@ -1013,7 +1170,7 @@ function build_osbi () {
 	local CC_PREFIX=$(get_tc_tuple glibc ${BASE_ISA_XLEN})-
 	local OSBI_MAKE_PARAMS=""
 
-	PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
+	local PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
 
 	pr_ann "OpenSBI for ${TARGET}/${BASE_ISA}"
 
@@ -1084,7 +1241,7 @@ function build_rootfs () {
 		rm -rf "${INSTALL_DIR}"
 	fi
 	mkdir -p "${INSTALL_DIR}"/{dev,proc,sys} &>> ${LOGFILE}
-	mkdir -p "${INSTALL_DIR}"/{root,etc,var/run,/lib/firmware} &>> ${LOGFILE}
+	mkdir -p "${INSTALL_DIR}"/{root,etc,var/run,lib/firmware} &>> ${LOGFILE}
 
 	pr_inf "Installing kernel modules..."
 	if [[ ! -f "${LINUX_INSTALL_DIR}"/vmlinux ]]; then
@@ -1146,16 +1303,35 @@ function bootstrap () {
 
 function bootstrap_fast () {
 	local LOGFILE=${TMP_DIR}/bootstrap.log
+	local PIDS=()
+	local LABELS=()
+	local FAILED=()
+	local tc=""
+	local i=0
+
 	pr_ann "Fetching toolchains from riscv-gnu-toolchain repository"
-	fetch_toolchain newlib 32 &
-	fetch_toolchain newlib 64 &
-	fetch_toolchain glibc 32 &
-	fetch_toolchain glibc 64 &
-	fetch_toolchain musl 32 &
-	fetch_toolchain musl 64 &
-	fetch_toolchain uclibc 32 &
-	fetch_toolchain uclibc 64 &
-	wait
+
+	# Fetching/extracting toolchains is I/O bound, so fire them all off at
+	# once and only collect exit codes afterwards. Waiting on a specific PID
+	# doesn't serialize the work (the jobs are already running), it just
+	# reaps a job that has finished or blocks until it does.
+	for tc in "newlib 32" "newlib 64" "glibc 32" "glibc 64" \
+		  "musl 32" "musl 64" "uclibc 32" "uclibc 64"; do
+		fetch_toolchain ${tc} &
+		PIDS+=($!)
+		LABELS+=("${tc// /}")
+	done
+
+	for i in "${!PIDS[@]}"; do
+		if ! wait "${PIDS[$i]}"; then
+			FAILED+=("${LABELS[$i]}")
+		fi
+	done
+
+	if [[ ${#FAILED[@]} != 0 ]]; then
+		die "Failed to fetch toolchain(s): ${FAILED[*]}" ${E_FETCH}
+	fi
+
 	deduplicate_files ${BINDIR} &>> ${LOGFILE}
 	build_qemu
 }

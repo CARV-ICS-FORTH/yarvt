@@ -7,14 +7,14 @@ mount -t devpts devpts /dev/pts
 mount -t proc -o nodev,noexec,nosuid proc /proc
 mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
 
+# Disable kernel log output on console
+dmesg -n1
+
 # Populate the remaining stuff for rootfs
 mkdir /tmp
-mkdir -p /var/log
-touch /var/log/wtmp
 mkdir -p /var/run
 touch /var/run/utmp
 mkdir /etc/dropbear
-touch /var/log/messages
 
 # Make sure /dev/console exists
 mknod -m 622 /dev/console c 5 1 &> /dev/null
@@ -31,10 +31,7 @@ echo "root:*::" > /etc/gshadow
 chmod go-rw /etc/gshadow
 
 # Start syslogd
-syslogd -C1024
-
-# Start mdev
-/sbin/mdev -d &> /dev/null
+syslogd -K
 
 # Initialize loopback interface
 ip link set lo up &> /dev/null
@@ -61,9 +58,6 @@ done
 
 # Update motd
 echo "$(uname -s -v -r -p -m)" >> /etc/motd
-
-# Disable kernel log output on console
-dmesg -n1
 
 # Print a greeting
 echo -e "\n\n\t\tWelcome to RISC-V !" > /dev/console
@@ -92,7 +86,6 @@ if [[ $? == 0 ]]; then
 		mkdir -p /usr/bin
 		ln -s /bin/dropbearmulti /usr/bin/dbclient
 	fi
-	ntpd &
 	echo "You may login remotely through ssh over network or" > /dev/console
 	if [[ ${SINGLE} -eq 0 ]]; then
 		echo "your host's port 2222 (in case of QEMU)" > /dev/console
