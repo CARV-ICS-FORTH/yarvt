@@ -1,5 +1,28 @@
 #!/bin/bash
 
+# Parse the kernel cmdline: apply the hostname and set SINGLE / INSTALLER,
+# keeping the CMDLINE/arg temporaries out of the global scope.
+function parse_cmdline () {
+	local CMDLINE=$(xargs -n1 -a /proc/cmdline)
+	local arg=""
+
+	SINGLE=0
+	INSTALLER=""
+	for arg in ${CMDLINE}; do
+		case "${arg}" in
+			systemd.hostname=*)
+				hostname "${arg#systemd.hostname=}"
+				;;
+			rescue)
+				SINGLE=1
+				;;
+			installer=*)
+				INSTALLER="${arg#installer=}"
+				;;
+		esac
+	done
+}
+
 # Initialize /dev and mount /proc and /sys
 mount -t devtmpfs none /dev
 mkdir /dev/pts
@@ -22,8 +45,6 @@ fi
 
 # Populate the remaining stuff for rootfs
 mkdir /tmp
-mkdir -p /var/run
-touch /var/run/utmp
 mkdir /etc/dropbear
 
 # Make sure /dev/console exists
@@ -49,22 +70,7 @@ ip addr add 127.0.0.1 dev lo &> /dev/null
 ip route add 127.0.0.0/255.0.0.0 dev lo &> /dev/null
 
 # Grab some parameters from kernel's cmdline
-SINGLE=0
-INSTALLER=""
-CMDLINE=$(xargs -n1 -a /proc/cmdline)
-for arg in ${CMDLINE}; do
-	case "${arg}" in
-		systemd.hostname=*)
-			hostname "${arg#systemd.hostname=}"
-			;;
-		rescue)
-			SINGLE=1
-			;;
-		installer=*)
-			INSTALLER="${arg#installer=}"
-			;;
-	esac
-done
+parse_cmdline
 
 # Update motd
 echo "$(uname -s -v -r -p -m)" >> /etc/motd

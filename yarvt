@@ -67,9 +67,6 @@ BBOX_SIGURL=https://busybox.net/downloads/busybox-1.38.0.tar.bz2.sig
 DBEAR_GITURL=https://github.com/mkj/dropbear.git
 DBEAR_GITBRANCH="DROPBEAR_2026.94"
 
-IPERF3_GITURL=https://github.com/esnet/iperf.git
-IPERF3_GITBRANCH="3.21"
-
 RVGTOOLCHAIN_GITURL=https://github.com/riscv-collab/riscv-gnu-toolchain.git
 RVGTOOLCHAIN_GITBRANCH="2026.07.15"
 RVGTOOLCHAIN_GITCOMMIT=""
@@ -721,74 +718,6 @@ function build_dropbear () {
 	cd "${SAVED_PWD}"
 }
 
-function build_iperf () {
-	local LOGFILE=${TMP_DIR}/iperf.log
-	local SOURCES_DIR="${SOURCES}"/iperf
-	local GITURL=${IPERF3_GITURL}
-	local INSTALL_DIR="${WORKDIR}"/${BASE_ISA}/rootfs
-	local BASE_ISA_XLEN=$(echo ${BASE_ISA} | tr -d [:alpha:])
-	local TC_INSTALL_DIR=$(get_tc_path musl ${BASE_ISA_XLEN})
-	local TARGET_TUPLE=$(get_tc_tuple musl ${BASE_ISA_XLEN})
-	local EXTRA_CFLAGS=""
-	local EXTRA_LDFLAGS=""
-	local MARCH=rv${BASE_ISA_XLEN}imafdc
-	local MABI=""
-
-	local PATH="${TC_INSTALL_DIR}"/bin:"${PATH}"
-
-	# There is already a binary there, if it's for the same BASE_ISA_XLEN
-	# as the image we are building just re-use it instead of recompiling it
-	# and getting the same binary anyway.
-	if [[ -f "${SOURCES_DIR}"/src/iperf3 ]]; then
-		${TARGET_TUPLE}-objdump -a "${SOURCES_DIR}"/src/iperf3 | grep "file format" | grep elf${BASE_ISA_XLEN} &>> ${LOGFILE}
-		if [[ $? == 0 ]]; then
-			pr_inf "Installing iperf3..."
-			cp "${SOURCES_DIR}"/src/iperf3 "${INSTALL_DIR}"/bin/
-			return
-		fi
-		make -C "${SOURCES_DIR}" distclean &>> ${LOGFILE}
-	fi
-
-	if [[ ${BASE_ISA_XLEN} == 64 ]]; then
-		MABI=lp64d
-	else
-		MABI=ilp32d
-		EXTRA_LDFLAGS="-l:libatomic.a"
-		# Skip for now until I find a way to fix this...
-		return
-	fi
-
-	EXTRA_CFLAGS="-Os -march=${MARCH} -mabi=${MABI} -mcmodel=medany"
-
-	if [[ ! -d "${TC_INSTALL_DIR}" ]]; then
-		die "Toolchain not present, did you run bootstrap ?" ${E_NOTC}
-	fi
-
-	pr_inf "Checking out iperf3 sources..."
-	get_git_sources ${IPERF3_GITBRANCH}
-
-	pr_inf "Configuring iperf3..."
-	cd "${SOURCES_DIR}"
-	autoreconf -ivf &>> ${LOGFILE}
-	make clean &>> ${LOGFILE}
-	CFLAGS="${EXTRA_CFLAGS} -ffunction-sections -fdata-sections" \
-	LDFLAGS="${EXTRA_LDFLAGS} -Wl,--gc-sections" \
-	./configure --enable-static-bin --without-sctp --with-openssl=no \
-		    --prefix="${INSTALL_DIR}" \
-		    --host=${TARGET_TUPLE} &>> ${LOGFILE}
-
-	pr_inf "Building iperf3..."
-	make -j ${NUM_JOBS} &>> ${LOGFILE}
-	if [[ ! -f "${SOURCES_DIR}"/src/iperf3 ]]; then
-		die "\tBuild failed, check out ${LOGFILE}" ${E_BUILD}
-	fi
-	${TARGET_TUPLE}-strip -s "${SOURCES_DIR}"/src/iperf3 &>> ${LOGFILE}
-	cp "${SOURCES_DIR}"/src/iperf3 "${INSTALL_DIR}"/bin/
-
-	cd "${SAVED_PWD}"
-}
-
-
 ######################
 # BOOTSTRAP COMMANDS #
 ######################
@@ -1254,7 +1183,6 @@ function build_rootfs () {
 
 	if [[ ${NO_NETWORK} == 0 && ${NOMMU_BUILD} == 0 ]]; then
 		build_dropbear
-		build_iperf
 	fi
 
 	pr_inf "Adding files and symlinks..."

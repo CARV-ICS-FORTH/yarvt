@@ -1,0 +1,203 @@
+#!/bin/bash
+#
+# apkify - Turn the running busybox/RAM rootfs into an Alpine environment so
+# that apk can install packages at runtime (iperf3, gdb, perf, ...).
+#
+# Unlike installer-alpine this does NOT install a target system: no OpenRC,
+# no runlevels, no separate root, no switch_root and no reboot. We just
+# overlay Alpine's minirootfs (apk + musl + base userland, and nothing else)
+# on top of the live root. The minirootfs deliberately ships no init, so PID1
+# (busybox init) and your current console/ssh session keep running untouched.
+#
+# Everything lives in RAM, so a reboot brings back the plain busybox rootfs.
+
+MIRROR=http://dl-cdn.alpinelinux.org/alpine
+BRANCH=edge
+
+##################
+# CONSOLE OUTPUT #
+##################
+
+function pr_ann () {
+	echo -e "\e[32m \n--=== ${1} ===--\e[0m"
+}
+
+function pr_inf () {
+	echo -e "\e[36m${1}\e[0m"
+}
+
+function pr_wrn () {
+	echo -e "\e[33m${1}\e[0m"
+}
+
+function pr_err () {
+	>&2 echo -e "\e[31m${1}\e[0m"
+}
+
+###################
+# INSTALLER STEPS #
+###################
+
+# Bail unless we are on a supported arch without apk already there. ${1} = arch
+function check_env () {
+	if [[ "${1}" != "riscv64" ]]; then
+		pr_err "Alpine has no '${1}' port (riscv64 only), aborting"
+		exit 1
+	fi
+	if [[ -x /sbin/apk ]]; then
+		pr_inf "apk is already available, nothing to do"
+		pr_inf "Install packages with: apk add <pkg>"
+		exit 0
+	fi
+}
+
+# Confirm the destructive overlay, unless SKIP_CONFIRM is set in the environment
+function confirm () {
+	local ANSWER=""
+
+	if [[ "${SKIP_CONFIRM}" != "" ]]; then
+		return 0
+	fi
+	echo -ne "\e[33mThis overwrites the running rootfs (in RAM, restored on reboot)."
+	echo -ne " Continue ? [y/N] \e[0m"
+	read ANSWER
+	case "${ANSWER}" in
+		y|Y)
+			return 0
+			;;
+		*)
+			pr_inf "Aborted"
+			exit 0
+			;;
+	esac
+}
+
+# Download the latest Alpine minirootfs for ${1} (arch) and overlay it on /
+function overlay_rootfs () {
+	local ARCH=${1}
+	local REL_URL=${MIRROR}/${BRANCH}/releases/${ARCH}
+	# /etc files init set up (login credentials, DNS) that Alpine's baselayout
+	# would clobber, so we stash and restore them around the overlay.
+	local PRESERVE="passwd shadow group gshadow shells hostname hosts resolv.conf motd"
+	local FILE=""
+	local SAVED=""
+	local i=""
+
+	pr_inf "Looking up the latest Alpine minirootfs..."
+	FILE=$(wget -qO- "${REL_URL}/latest-releases.yaml" 2> /dev/null | \
+	       grep -oE "alpine-minirootfs-[0-9][^ ]*-${ARCH}\.tar\.gz" | head -1)
+	if [[ "${FILE}" == "" ]]; then
+		pr_err "Couldn't find a minirootfs image (is the network up ?)"
+		exit 1
+	fi
+
+	pr_inf "Downloading ${FILE}..."
+	wget -q "${REL_URL}/${FILE}" -O "/tmp/${FILE}"
+	if [[ $? != 0 ]]; then
+		pr_err "Download failed (is the network up ?)"
+		rm -f "/tmp/${FILE}"
+		exit 1
+	fi
+
+	pr_inf "Preserving login/DNS configuration..."
+	SAVED=$(mktemp -d)
+	for i in ${PRESERVE}; do
+		if [[ -e "/etc/${i}" ]]; then
+			cp -a "/etc/${i}" "${SAVED}/${i}"
+		fi
+	done
+
+	# Alpine's baselayout ships /var/run as a symlink to /run, but our image
+	# has it as a real directory. busybox tar aborts the whole extraction when
+	# it can't replace that directory with the symlink (it sits near the start
+	# of the archive, so apk and musl never get unpacked). Drop it first, the
+	# tarball itself provides the /run target.
+	pr_inf "Unpacking Alpine over /..."
+	rm -rf /var/run
+	tar xzf "/tmp/${FILE}" -C /
+	rm -f "/tmp/${FILE}"
+
+	for i in ${PRESERVE}; do
+		if [[ -e "${SAVED}/${i}" ]]; then
+			cp -a "${SAVED}/${i}" "/etc/${i}"
+		fi
+	done
+	rm -rf "${SAVED}"
+
+	if [[ ! -x /sbin/apk ]]; then
+		pr_err "apk isn't there, the overlay failed (check the network / disk space)"
+		exit 1
+	fi
+}
+
+# Point apk at the repositories, refresh the index and put a real bash back
+function setup_apk () {
+	pr_inf "Configuring apk repositories..."
+	mkdir -p /etc/apk
+	echo "${MIRROR}/${BRANCH}/main" > /etc/apk/repositories
+	echo "${MIRROR}/${BRANCH}/community" >> /etc/apk/repositories
+
+	pr_inf "Updating the package index..."
+	/sbin/apk update
+	if [[ $? != 0 ]]; then
+		pr_err "apk update failed"
+		exit 1
+	fi
+
+	# Alpine's busybox has no 'bash' applet, but our login shell is /bin/bash,
+	# so put a real bash back before anyone opens a new shell.
+	pr_inf "Installing bash..."
+	/sbin/apk add bash
+
+	# Unlikely after a good 'apk update', but if bash didn't install then
+	# /bin/bash is still the (bash-less) busybox symlink. /etc/passwd points
+	# logins at it, so a logout would lock us out - fall back to /bin/sh.
+	/bin/bash -c ':' &> /dev/null
+	if [[ $? != 0 ]]; then
+		pr_wrn "bash unavailable, pointing root's login shell at /bin/sh"
+		sed -i 's#:/bin/bash$#:/bin/sh#' /etc/passwd
+	fi
+}
+
+# Hand off to Alpine's bash so we drop the initramfs busybox. If a command was
+# passed (${@}, e.g. an installer) run it under bash, otherwise drop into an
+# interactive shell. Skips the exec if bash didn't install (setup_apk fell back
+# to /bin/sh). We drop our own variables first so they don't taint the handoff.
+function switch_to_bash () {
+	if ! /bin/bash -c ':' &> /dev/null; then
+		return 0
+	fi
+
+	unset MIRROR BRANCH SKIP_CONFIRM
+
+	if [[ "$#" != "0" ]]; then
+		exec /bin/bash -c "$*"
+	fi
+
+	pr_inf "Install packages with apk, e.g.:"
+	pr_inf "\tapk add iperf3"
+	pr_wrn "This is a RAM overlay: a reboot restores the plain busybox environment."
+	pr_inf "Switching to bash..."
+	exec /bin/bash
+}
+
+########
+# MAIN #
+########
+
+# A command to run (handed to bash below) implies non-interactive use, so
+# don't prompt for confirmation in that case.
+if [[ "$#" != "0" ]]; then
+	SKIP_CONFIRM=1
+fi
+
+pr_ann "Overlaying Alpine (${BRANCH}/$(uname -m)) onto the running rootfs"
+
+check_env "$(uname -m)"
+confirm
+overlay_rootfs "$(uname -m)"
+setup_apk
+
+pr_ann "Alpine is live"
+
+switch_to_bash "$@"
