@@ -1,0 +1,155 @@
+#!/bin/bash
+#
+# installer-functions - Helpers shared by the distro installers
+# (installer-alpine, installer-ubuntu, ...).
+#
+# Each installer sources this file, provides its own download_initrootfs()
+# and initialize_rootfs(), and drives the installation through
+# installer_common_main(). Everything that isn't distro-specific lives here.
+
+##################
+# CONSOLE OUTPUT #
+##################
+
+function pr_ann () {
+	echo -e "\e[32m \n--=== ${1} ===--\e[0m"
+}
+
+function pr_inf () {
+	echo -e "\e[36m${1}\e[0m"
+}
+
+function pr_wrn () {
+	echo -e "\e[33m${1}\e[0m"
+}
+
+function pr_err () {
+	>&2 echo -e "\e[31m${1}\e[0m"
+}
+
+###########
+# HELPERS #
+###########
+
+function run_in_chroot () {
+	chroot ${PREFIX} $@
+}
+
+###################
+# INSTALLER STEPS #
+###################
+
+function timesync () {
+	local HTTP_DATE_STRING=$(wget -qS www.google.com -O /dev/null 2>&1 | grep "Date:" | awk -F", " '{print $2}' | awk '{print $3"-"$2"-"$1" "$4}')
+	local MONTH_STR=$(echo ${HTTP_DATE_STRING} | awk -F"-" '{print $2}')
+	local MONTHS="JanFebMarAprMayJunJulAugSepOctNovDec"
+	local MONTHS_TRIMMED=${MONTHS%%$MONTH_STR*}
+	local MONTHS_TRIMMED_LEN=${#MONTHS_TRIMMED}
+	local MONTH_NUM=$(printf "%02d" $((MONTHS_TRIMMED_LEN/3+1)))
+	local DATE_STRING=$(echo ${HTTP_DATE_STRING} | sed -e "s/${MONTH_STR}/${MONTH_NUM}/g")
+	pr_ann "Syncing time with google.com"
+	pr_inf "Http date string: \"${HTTP_DATE_STRING}\""
+	date -u "${DATE_STRING}"
+}
+
+function get_prefix_from_cmdline () {
+	local CMDLINE_PREFIX=$(cat /proc/cmdline | awk -F "installer_prefix=" '{print $2}' | awk '{print $1}')
+	if [[ "${CMDLINE_PREFIX}" != "" ]]; then
+		pr_inf "Got installer prefix from kernel cmdline: ${CMDLINE_PREFIX}"
+		pr_inf "Mounting NFS export to /mnt/target"
+		PREFIX=/mnt/target
+		mkdir -p ${PREFIX}
+		mount -tnfs4 -orsize=8192,wsize=8192 10.0.2.2:${CMDLINE_PREFIX} ${PREFIX}
+		if [[ $? != 0 ]]; then
+			pr_err "Couldn't mount NFS export"
+			exit 1
+		fi
+		ls -lah ${PREFIX}/* &> /dev/null
+		if [[ $? == 0 ]]; then
+			pr_err "NFS Export not empty"
+			exit 1
+		fi
+		AUTO=1
+	else
+		exit 1
+	fi
+}
+
+function prepare_chroot () {
+	pr_ann "Setting up chroot environment"
+
+	pr_inf "Copying resolv.conf"
+	rm -f ${PREFIX}/etc/resolv.conf
+	cp -L /etc/resolv.conf ${PREFIX}/etc/resolv.conf
+
+	pr_inf "Mounting /proc"
+	mount -t proc none ${PREFIX}/proc
+
+	pr_inf "Mounting /dev"
+	mount --rbind /dev ${PREFIX}/dev
+	mount --make-rslave ${PREFIX}/dev
+
+	pr_inf "Mounting /sys"
+	mount --rbind /sys ${PREFIX}/sys
+	mount --make-rslave ${PREFIX}/sys
+
+	pr_inf "Mounting /run"
+	if [[ -d /run ]]; then
+		mount --rbind /run ${PREFIX}/run
+		mount --make-rslave ${PREFIX}/run
+	fi
+}
+
+function cleanup () {
+	sync;sync
+
+	pr_inf "Unmounting /proc"
+	for i in $(mount | grep ${PREFIX}/proc | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount ${PREFIX}/proc &> /dev/null
+
+	pr_inf "Unmounting /dev"
+	for i in $(mount | grep ${PREFIX}/dev | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount -l ${PREFIX}/dev &> /dev/null
+
+	pr_inf "Unmounting /sys"
+	for i in $(mount | grep ${PREFIX}/sys | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount ${PREFIX}/sys &> /dev/null
+
+	if [[ -d /run ]]; then
+		pr_inf "Unmounting /run"
+		for i in $(mount | grep ${PREFIX}/run | awk '{print $3}'); do
+			umount ${i} &> /dev/null
+		done
+		umount ${PREFIX}/run
+	fi
+}
+
+########
+# MAIN #
+########
+
+# Shared install sequence. The distro installer defines download_initrootfs()
+# and initialize_rootfs(), then calls this with "$@". PREFIX is taken from the
+# first argument or, when it's missing, from the kernel cmdline
+# (installer_prefix=, NFS mode - which sets AUTO=1 so the caller knows to halt).
+function installer_common_main () {
+	PREFIX=${1}
+	AUTO=0
+
+	if [[ $# != 1 ]]; then
+		pr_wrn "Installation prefix not provided"
+		get_prefix_from_cmdline
+	fi
+
+	timesync
+	download_initrootfs
+	prepare_chroot
+	initialize_rootfs
+	cleanup
+}
