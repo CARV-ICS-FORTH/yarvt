@@ -1188,12 +1188,20 @@ function build_rootfs () {
 	pr_inf "Adding files and symlinks..."
 	cd "${INSTALL_DIR}"
 	cp -p "${SCRIPT_PATH}"/files/init ./sbin/initscript
-	cp -p "${SCRIPT_PATH}"/files/inittab ./etc/
 	cp -p "${SCRIPT_PATH}"/files/udhcpc_handler.sh ./etc/
 	cp -p "${SCRIPT_PATH}"/files/motd ./etc/
 	cp -p "${SCRIPT_PATH}"/files/extra/* ./bin/ &> /dev/null
 	fakeroot -s ${TMP_DIR}/frstate mknod -m 622 dev/console c 5 1
-	ln -s ./bin/busybox ./init
+	# Our script is PID 1 (so it can switch_root into an installed system); it
+	# stays PID 1 and handles reaping/shutdown itself, no busybox init involved.
+	ln -s ./sbin/initscript ./init
+	# cttyhack lives only in our busybox, not Alpine's. Make it a standalone
+	# hardlink to the busybox binary (instead of the usual symlink to
+	# /bin/busybox) so it survives apkify overlaying Alpine's busybox: tar
+	# unlinks the old /bin/busybox, but this hardlink keeps that inode - our
+	# busybox, with the applet - alive.
+	rm -f ./bin/cttyhack
+	ln ./bin/busybox ./bin/cttyhack
 
 	if [[ ${INITRAMFS_SKIP_IMAGE} == 1 ]]; then
 		cd "${SAVED_PWD}"

@@ -32,7 +32,10 @@ function pr_err () {
 ###########
 
 function run_in_chroot () {
-	chroot ${PREFIX} $@
+	# Force a sane PATH: chroot resolves the command with execvp() against the
+	# caller's PATH, which (e.g. from init's console shell) may omit /sbin, so
+	# target binaries like apk / rc-update wouldn't be found in the new root.
+	PATH=/usr/sbin:/usr/bin:/sbin:/bin chroot ${PREFIX} $@
 }
 
 ###################
@@ -126,7 +129,7 @@ function cleanup () {
 		for i in $(mount | grep ${PREFIX}/run | awk '{print $3}'); do
 			umount ${i} &> /dev/null
 		done
-		umount ${PREFIX}/run
+		umount -l ${PREFIX}/run &> /dev/null
 	fi
 }
 
@@ -134,18 +137,51 @@ function cleanup () {
 # MAIN #
 ########
 
-# Shared install sequence. The distro installer defines download_initrootfs()
-# and initialize_rootfs(), then calls this with "$@". PREFIX is taken from the
-# first argument or, when it's missing, from the kernel cmdline
-# (installer_prefix=, NFS mode - which sets AUTO=1 so the caller knows to halt).
-function installer_common_main () {
-	PREFIX=${1}
-	AUTO=0
+# Work out where we install and set PREFIX (and AUTO, so the distro knows if it
+# was invoked interactively). An explicit argument wins; otherwise read the
+# kernel cmdline: yarvt.bootmode=nfs uses the export init already mounted at
+# /mnt/target (mounting it ourselves if run standalone), yarvt.bootmode=nvme
+# partitions/mounts a disk, and the older installer_prefix= convention still
+# works for the eupilot profiles.
+function prepare_target () {
+	local bootmode=$(xargs -n1 -a /proc/cmdline | grep '^yarvt.bootmode=' | cut -d= -f2)
+	local prefix=""
 
-	if [[ $# != 1 ]]; then
-		pr_wrn "Installation prefix not provided"
-		get_prefix_from_cmdline
+	AUTO=0
+	if [[ "${1}" != "" ]]; then
+		PREFIX=${1}
+		return 0
 	fi
+
+	case "${bootmode}" in
+		nfs)
+			PREFIX=/mnt/target
+			AUTO=1
+			if ! grep -q " /mnt/target " /proc/mounts; then
+				prefix=$(xargs -n1 -a /proc/cmdline | grep '^yarvt.nfs_prefix=' | cut -d= -f2)
+				mkdir -p ${PREFIX}
+				mount -tnfs4 -orsize=8192,wsize=8192 10.0.2.2:${prefix} ${PREFIX}
+				if [[ $? != 0 ]]; then
+					pr_err "Couldn't mount NFS export ${prefix}"
+					exit 1
+				fi
+			fi
+			;;
+		nvme)
+			pr_err "NVMe install (storage_init) is not implemented yet"
+			exit 1
+			;;
+		*)
+			pr_wrn "Installation prefix not provided"
+			get_prefix_from_cmdline
+			;;
+	esac
+}
+
+# Shared install sequence. The distro installer defines download_initrootfs()
+# and initialize_rootfs(), then calls this with "$@".
+function installer_common_main () {
+	prepare_target "${1}"
 
 	timesync
 	download_initrootfs

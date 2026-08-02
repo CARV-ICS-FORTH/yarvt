@@ -1,2 +1,0 @@
-::sysinit:/sbin/initscript
-::shutdown:/bin/umount -a -r &> /dev/null
