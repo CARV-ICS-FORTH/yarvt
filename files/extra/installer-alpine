@@ -90,6 +90,28 @@ function initialize_rootfs () {
 
 	pr_inf "Configuring console"
 	sed -i '/ttyS0/s/^#//g' ${PREFIX}/etc/inittab
+
+	# On a local (NVMe) install give OpenRC an fstab and the services that act on
+	# it; over NFS the root is all we have and init's switch_root handles that.
+	if target_is_local; then
+		pr_inf "Configuring on-disk mounts (fstab + localmount/swap)"
+		write_fstab
+		# The installed system needs fsck.ext4 (from e2fsprogs) to check its own
+		# filesystems at boot - the NFS path never touches a local disk.
+		pr_inf "Installing filesystem tools (e2fsprogs)"
+		run_in_chroot apk add e2fsprogs
+		run_in_chroot rc-update add localmount boot
+		if [[ -e ${PREFIX}/etc/init.d/swap ]]; then
+			run_in_chroot rc-update add swap boot
+		fi
+		# Over NFS the initramfs already brought eth0 up (and the root rides on
+		# it, so we must not disturb it); a local root boots with no network, so
+		# have the installed system DHCP eth0 itself.
+		pr_inf "Enabling DHCP on eth0"
+		echo "" >> ${PREFIX}/etc/network/interfaces
+		echo "auto eth0" >> ${PREFIX}/etc/network/interfaces
+		echo "iface eth0 inet dhcp" >> ${PREFIX}/etc/network/interfaces
+	fi
 }
 
 ########

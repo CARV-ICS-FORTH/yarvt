@@ -133,6 +133,278 @@ function cleanup () {
 	fi
 }
 
+##########################
+# STORAGE INITIALIZATION #
+##########################
+
+# Minimum disk size (GiB) we'll install onto on real hardware.
+MIN_TOT_SIZE=80.0
+
+# awk-based float compare: succeeds (0) when ${1} < ${2}.
+function less_than () {
+	local RESULT=$(awk -v n1=${1} -v n2=${2} 'BEGIN {printf (n1<n2?"0":"1")}')
+	$(exit ${RESULT})
+}
+
+# Read the total size (GiB) of block device ${1} into the variable named ${2},
+# making sure it's unpartitioned (we zap it first) and large enough.
+function get_storage_info () {
+	local TOT_SIZE=$(sgdisk -p ${1} | grep "Disk ${1}" | awk -F": " '{print $2}' | awk -F " sectors, " '{print $2}')
+	local TOT_FREE=$(sgdisk -p ${1} | grep "Total free space" | awk -F "sectors " '{print $2}' | sed 's/^.//;s/.$//')
+
+	if [[ ${TOT_FREE} != ${TOT_SIZE} ]]; then
+		pr_err "Disk already has allocated partitions"
+		exit 1
+	fi
+
+	# Size may be reported in GiB or TiB, normalize to GiB.
+	if echo ${TOT_SIZE} | grep "GiB" &> /dev/null; then
+		TOT_SIZE=$(echo ${TOT_SIZE} | awk '{print $1}')
+	elif echo ${TOT_SIZE} | grep "TiB" &> /dev/null; then
+		TOT_SIZE=$(echo ${TOT_SIZE} | awk '{print $1*1024}')
+	else
+		pr_err "Invalid size: ${TOT_SIZE}"
+		exit 1
+	fi
+
+	if $(less_than ${TOT_SIZE} ${MIN_TOT_SIZE}); then
+		pr_err "Not enough space on ${1}"
+		exit 1
+	fi
+
+	eval ${2}="${TOT_SIZE}"
+}
+
+# We want /boot to also be the ESP so we can boot kernels directly as EFI stubs
+# without a boot loader. 300M is plenty for a couple of kernel images.
+function get_esp_size () {
+	echo "300M"
+}
+
+# 15-20GB is enough for most rootfs; scale up a bit for larger disks assuming the
+# user piles on more tools. Out-of-tree stuff can always live on /opt or /home.
+function get_rootpart_size () {
+	local TOT_SIZE=${1}
+
+	if $(less_than ${TOT_SIZE}  "100.0"); then
+		echo "20G"
+	elif $(less_than ${TOT_SIZE}  "128.0"); then
+		echo "30G"
+	elif $(less_than ${TOT_SIZE}  "256.0"); then
+		echo "40G"
+	elif $(less_than ${TOT_SIZE}  "512.0"); then
+		echo "60G"
+	else
+		echo "80G"
+	fi
+}
+
+# 8-12GB covers most /var; scale up for larger disks (binhosts, containers).
+# Sub-directories can always be mounted elsewhere later if needed.
+function get_varpart_size () {
+	local TOT_SIZE=${1}
+
+	if $(less_than ${TOT_SIZE}  "100.0"); then
+		echo "8G"
+	elif $(less_than ${TOT_SIZE}  "128.0"); then
+		echo "12G"
+	elif $(less_than ${TOT_SIZE}  "256.0"); then
+		echo "18G"
+	elif $(less_than ${TOT_SIZE}  "512.0"); then
+		echo "26G"
+	else
+		echo "40G"
+	fi
+}
+
+# 8GB is a reasonable fixed swap for systems with >=8GB RAM (hibernation aside,
+# which is better served by a swapfile on the machines that actually need it).
+function get_swappart_size () {
+	echo "8G"
+}
+
+# Echo the local install disk: virtio-blk (/dev/vda) under QEMU, or NVMe
+# (/dev/nvme0n1) on real hardware (and QEMU's debug backend). Empty if neither
+# is present.
+function find_disk () {
+	if [[ -b /dev/vda ]]; then
+		echo /dev/vda
+	elif [[ -b /dev/nvme0n1 ]]; then
+		echo /dev/nvme0n1
+	fi
+}
+
+# Partition the local disk with a Discoverable-Partitions layout (ESP + root +
+# var + swap + home, riscv64 type GUIDs), format and label it (init boots the
+# partition labelled yarvt-root), and mount it under /mnt/target. Runs under
+# apkify, so we apk-add the tools we need. Sets PREFIX.
+function storage_init () {
+	local ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+	local ROOT_GUID="72ec70a6-cf74-40e6-bd49-4bda08e8f224"
+	local VAR_GUID="4d21b016-b534-45c2-a9fb-5c16e091fd2d"
+	local SWAP_GUID="0657fd6d-a4ab-43c4-84e5-0933c84b4f4f"
+	local HOME_GUID="933ac7e1-2eb4-4f13-b844-0e14e2aef915"
+	local DISK=""
+	local PART=""
+	local DISKNAME=""
+	local SERIAL=""
+	local IS_QEMU=0
+	local TOT_MIB=0
+	local TOT_SIZE=""
+	local ESP_SIZE="" ROOT_SIZE="" VAR_SIZE="" SWAP_SIZE=""
+	local i=0
+
+	DISK=$(find_disk)
+	if [[ "${DISK}" == "" ]]; then
+		pr_err "No local disk found (expected /dev/vda or /dev/nvme0n1)"
+		exit 1
+	fi
+
+	# Partition nodes: device names ending in a digit take a 'p' separator
+	# (nvme0n1 -> nvme0n1p1), the rest don't (vda -> vda1).
+	case "${DISK}" in
+		*[0-9]) PART="${DISK}p" ;;
+		*)      PART="${DISK}" ;;
+	esac
+	DISKNAME=${DISK#/dev/}
+
+	pr_ann "Preparing storage on ${DISK}"
+
+	pr_inf "Installing partitioning tools (sgdisk, mkfs.ext4, mkfs.fat)"
+	apk add sgdisk e2fsprogs e2fsprogs-extra dosfstools
+	if [[ $? != 0 ]]; then
+		pr_err "Couldn't install the storage tools"
+		exit 1
+	fi
+
+	# Never overwrite a disk that already holds a partition table we didn't create
+	# - it could be another OS. A blank disk, or a previous yarvt layout (which we
+	# recognize by our riscv64 root type GUID), is safe to (re)initialize.
+	if ls ${PART}1 &> /dev/null; then
+		if sgdisk -i 2 "${DISK}" 2> /dev/null | grep -qi "${ROOT_GUID}"; then
+			pr_wrn "Re-initializing an existing yarvt layout on ${DISK}"
+		else
+			pr_err "${DISK} already has an unrecognized partition table;"
+			pr_err "refusing to overwrite it (wipe it by hand to install here)"
+			exit 1
+		fi
+	fi
+
+	# Start from a clean slate: init only runs us when nothing is installed, but
+	# the disk may still carry a stale / failed yarvt attempt.
+	sgdisk --zap-all "${DISK}" &> /dev/null
+
+	# Pick the layout: under QEMU scale it to the image, on real hardware use the
+	# size tiers. virtio-blk only shows up under QEMU, so /dev/vda is QEMU by
+	# construction; an NVMe disk is either QEMU's debug backend (which we tag with
+	# a "YRVT..." serial) or a real disk on actual hardware.
+	IS_QEMU=0
+	if [[ "${DISK}" == "/dev/vda" ]]; then
+		IS_QEMU=1
+	else
+		SERIAL=$(cat /sys/block/${DISKNAME}/device/serial 2> /dev/null)
+		[[ "${SERIAL}" == YRVT* ]] && IS_QEMU=1
+	fi
+	if [[ ${IS_QEMU} -eq 1 ]]; then
+		# Scale to the image: root gets ~half (it also holds /opt, which Ubuntu
+		# fills with a ~5G toolchain), var ~a fifth, home whatever's left; ESP and
+		# swap stay small and fixed.
+		TOT_MIB=$(( $(cat /sys/block/${DISKNAME}/size) / 2048 ))
+		ESP_SIZE="100M"
+		ROOT_SIZE="$(( TOT_MIB / 2 ))M"
+		VAR_SIZE="$(( TOT_MIB / 5 ))M"
+		SWAP_SIZE="512M"
+	else
+		get_storage_info "${DISK}" TOT_SIZE
+		ESP_SIZE=$(get_esp_size)
+		ROOT_SIZE=$(get_rootpart_size "${TOT_SIZE}")
+		VAR_SIZE=$(get_varpart_size "${TOT_SIZE}")
+		SWAP_SIZE=$(get_swappart_size)
+	fi
+
+	pr_inf "Creating GPT partitions (ESP / root / var / swap / home)"
+	sgdisk -n "1:0:+${ESP_SIZE}"  -t "1:${ESP_GUID}"  -c "1:ESP" \
+	       -n "2:0:+${ROOT_SIZE}" -t "2:${ROOT_GUID}" -c "2:root" \
+	       -n "3:0:+${VAR_SIZE}"  -t "3:${VAR_GUID}"  -c "3:var" \
+	       -n "4:0:+${SWAP_SIZE}" -t "4:${SWAP_GUID}" -c "4:swap" \
+	       -n "5:0:0"             -t "5:${HOME_GUID}" -c "5:home" \
+	       "${DISK}" &> /dev/null
+	if [[ $? != 0 ]]; then
+		pr_err "Partitioning ${DISK} failed (is the disk large enough ?)"
+		exit 1
+	fi
+
+	# Re-read the table and wait for the last partition node to show up.
+	partprobe "${DISK}" &> /dev/null
+	while [[ ${i} -lt 5 ]]; do
+		[[ -b "${PART}5" ]] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	if [[ ! -b "${PART}5" ]]; then
+		pr_err "Partition nodes didn't appear under ${DISK}"
+		exit 1
+	fi
+
+	pr_inf "Formatting and labelling the partitions"
+	mkfs.fat -F 32 "${PART}1"
+	mkfs.ext4 -L yarvt-root "${PART}2"
+	mkfs.ext4 -L yarvt-var  "${PART}3"
+	mkswap    -L yarvt-swap "${PART}4"
+	mkfs.ext4 -L yarvt-home "${PART}5"
+
+	pr_inf "Mounting the new filesystems under /mnt/target"
+	PREFIX=/mnt/target
+	mkdir -p ${PREFIX}
+	mount "${PART}2" ${PREFIX}
+	# Keep the root-fs copies of these mountpoints empty and immutable so the real
+	# partitions always shadow them cleanly: a missing mount then fails loudly
+	# instead of silently writing to the root fs, and once we boot via UEFI
+	# systemd's gpt-auto-generator won't skip them as "already populated".
+	mkdir -p ${PREFIX}/var ${PREFIX}/home
+	chmod ugo-w ${PREFIX}/var ${PREFIX}/home
+	chattr +i ${PREFIX}/var ${PREFIX}/home
+	mount "${PART}3" ${PREFIX}/var
+	mount "${PART}5" ${PREFIX}/home
+	swapon "${PART}4" &> /dev/null
+}
+
+# Write the target's /etc/fstab for a local-disk install. init mounts the root
+# (found by its yarvt-root label) and switch_roots into it; the installed system
+# mounts the rest from here.
+function write_fstab () {
+	pr_inf "Writing /etc/fstab"
+	{
+		echo "LABEL=yarvt-root   /      ext4   defaults       0 1"
+		echo "LABEL=yarvt-var    /var   ext4   nodev,nosuid   0 2"
+		echo "LABEL=yarvt-home   /home  ext4   nodev,nosuid   0 2"
+		echo "LABEL=yarvt-swap   none   swap   sw             0 0"
+	} > ${PREFIX}/etc/fstab
+}
+
+# True when the target (PREFIX) sits on a local disk rather than on an NFS export
+# - i.e. it needs its own on-disk mount setup. We can tell by the time we get
+# here: a local root shows a /dev node under df, an NFS one shows host:/path.
+function target_is_local () {
+	local SRC=$(df -P ${PREFIX} | awk 'NR==2 {print $1}')
+	[[ "${SRC}" == /dev/* ]]
+}
+
+# For a local-disk Ubuntu install, key the /var partition to this machine so
+# systemd's gpt-auto-generator discovers and mounts it (root/home/swap are
+# matched by their DPS type GUIDs already). Sets partition 3's GUID to the
+# machine-specific value derived from /etc/machine-id.
+function set_var_partuuid () {
+	local DISK=$(find_disk)
+	local VAR_GUID="4d21b016-b534-45c2-a9fb-5c16e091fd2d"
+	local VAR_PARTUUID=""
+
+	pr_inf "Keying the /var partition to this machine (DPS auto-mount)"
+	run_in_chroot systemd-machine-id-setup &> /dev/null
+	VAR_PARTUUID=$(run_in_chroot systemd-id128 -u --app-specific=${VAR_GUID} machine-id)
+	sgdisk --partition-guid=3:${VAR_PARTUUID} ${DISK} &> /dev/null
+}
+
 ########
 # MAIN #
 ########
@@ -140,9 +412,9 @@ function cleanup () {
 # Work out where we install and set PREFIX (and AUTO, so the distro knows if it
 # was invoked interactively). An explicit argument wins; otherwise read the
 # kernel cmdline: yarvt.bootmode=nfs uses the export init already mounted at
-# /mnt/target (mounting it ourselves if run standalone), yarvt.bootmode=nvme
-# partitions/mounts a disk, and the older installer_prefix= convention still
-# works for the eupilot profiles.
+# /mnt/target (mounting it ourselves if run standalone), yarvt.bootmode=disk
+# partitions/mounts the local disk, and the older installer_prefix= convention
+# still works for the eupilot profiles.
 function prepare_target () {
 	local bootmode=$(xargs -n1 -a /proc/cmdline | grep '^yarvt.bootmode=' | cut -d= -f2)
 	local prefix=""
@@ -167,9 +439,9 @@ function prepare_target () {
 				fi
 			fi
 			;;
-		nvme)
-			pr_err "NVMe install (storage_init) is not implemented yet"
-			exit 1
+		disk)
+			AUTO=1
+			storage_init
 			;;
 		*)
 			pr_wrn "Installation prefix not provided"

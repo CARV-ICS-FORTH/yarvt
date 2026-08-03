@@ -83,10 +83,15 @@ function init_console () {
 	pr_ann "Welcome to RISC-V"
 }
 
-# Load the NVMe driver if a controller is present but unbound (e.g. built as a
-# module), so /dev/nvme* shows up before we look for it.
-function load_nvme () {
-	# Nothing to do without an NVMe controller (PCI class 0108) on the bus.
+# Make sure the storage drivers are up so the backing disk shows up before we go
+# looking for it: virtio-blk (QEMU's default backend) is usually built in, and
+# NVMe (the disk on real hardware, QEMU's debug backend) may be a module we load
+# if a controller is present. The virtio-blk nudge is a harmless no-op on a real
+# hardware kernel that has no such driver.
+function load_storage () {
+	modprobe virtio_blk &> /dev/null
+
+	# Nothing more to do without an NVMe controller (PCI class 0108) on the bus.
 	if ! lspci | grep -q "Class 0108"; then
 		return 0
 	fi
@@ -103,7 +108,7 @@ function load_nvme () {
 
 # Bring up loopback and eth0, apply the requested hostname and get an IPv4 lease
 # via DHCP. Best effort: returns 1 if eth0 ends up without an address, so the
-# caller can decide whether that's fatal (installers, NFS) or not (nvme boot).
+# caller can decide whether that's fatal (installers, NFS) or not (disk boot).
 # Idempotent - does nothing if eth0 is already configured (previous call or
 # kernel ip= autoconf).
 function init_network () {
@@ -160,14 +165,18 @@ function boot_or_install () {
 	local i=0
 
 	case "${BOOTMODE}" in
-		nvme)
+		disk)
+			# Wait for the local disk to appear: virtio-blk (vda) under QEMU, or
+			# NVMe (nvme0n1) on real hardware (and QEMU's debug backend).
 			while [[ ${i} -lt 5 ]]; do
-				ls /dev/nvme0n1 &> /dev/null && break
+				if [[ -b /dev/vda ]] || [[ -b /dev/nvme0n1 ]]; then
+					break
+				fi
 				sleep 1
 				i=$((i + 1))
 			done
-			if ! ls /dev/nvme0n1 &> /dev/null; then
-				pr_err "yarvt.bootmode=nvme but no NVMe device found"
+			if [[ ! -b /dev/vda ]] && [[ ! -b /dev/nvme0n1 ]]; then
+				pr_err "yarvt.bootmode=disk but no local disk found"
 				return 1
 			fi
 			ROOT_DEV=$(blkid | grep 'LABEL="yarvt-root"' | head -1)
@@ -301,7 +310,7 @@ function main () {
 	trap 'shutdown_handler reboot'   TERM
 
 	init_console
-	load_nvme
+	load_storage
 
 	# If a storage backend was requested (and we weren't forced into rescue), try
 	# to boot the system installed on it or run its installer. boot_or_install

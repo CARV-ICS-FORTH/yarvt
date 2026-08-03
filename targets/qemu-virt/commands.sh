@@ -9,8 +9,9 @@ function target_usage () {
 	pr_inf "\trun_linux32 [backend] [distro]: Run a 32bit QEMU instance with osbi+linux+initramfs"
 	pr_inf "\trun_linux64 [backend] [distro]: Run a 64bit QEMU instance with osbi+linux+initramfs"
 	pr_wrn "\t[backend]: Optional storage backend to install onto / boot from. A raw disk"
-	pr_wrn "\t           image path (created if missing) is attached as an NVMe device; an"
-	pr_wrn "\t           existing directory is used as an NFS root (the host must export it)."
+	pr_wrn "\t           image path (created if missing) is attached as a virtio-blk disk"
+	pr_wrn "\t           (NVMe if QEMU_VIRT_FORCE_NVME is set); an existing directory is"
+	pr_wrn "\t           used as an NFS root (the host must export it)."
 	pr_wrn "\t[distro]:  alpine or ubuntu - installed onto an empty backend on first boot."
 }
 
@@ -61,8 +62,8 @@ function target_bootstrap () {
 function run_linux () {
 	local BACKEND=${1}
 	local DISTRO=${2}
-	local NVME_SIZE=8G
-	local NVME_ARGS=""
+	local DISK_SIZE=8G
+	local DISK_ARGS=""
 	local APPEND=""
 	local EXTRA_ARGS=()
 	local SAVED_PWD=${PWD}
@@ -86,30 +87,36 @@ function run_linux () {
 	# Pick the storage backend from the argument and tell the guest about it
 	# through yarvt.bootmode (init then boots what's installed there or runs
 	# the installer):
-	#  - an existing directory  -> NFS root (the host must export it to the guest)
-	#  - an existing raw image   -> attached as an NVMe device
-	#  - a non-existing path      -> a raw NVMe image is created there first
+	#  - an existing directory   -> NFS root (the host must export it to the guest)
+	#  - an existing raw image    -> attached as a local disk
+	#  - a non-existing path       -> a raw disk image is created there first
+	# The disk is a virtio-blk device by default (far cheaper under TCG); set
+	# QEMU_VIRT_FORCE_NVME to attach it as an emulated NVMe instead, for debugging
+	# the NVMe path (that's what runs on real hardware).
 	if [[ "${BACKEND}" != "" ]]; then
 		if [[ -d "${BACKEND}" ]]; then
 			BACKEND=$(realpath "${BACKEND}")
 			pr_inf "Installing/booting over NFS from ${BACKEND} (host must export it)"
 			APPEND="yarvt.bootmode=nfs yarvt.nfs_prefix=${BACKEND}"
-		elif [[ -f "${BACKEND}" ]]; then
-			pr_inf "Using existing disk image ${BACKEND} as an NVMe device"
-			NVME_ARGS="-drive file=${BACKEND},if=none,id=nvm0,format=raw"
-			NVME_ARGS="${NVME_ARGS} -device nvme,serial=YRVT0000000000000001,drive=nvm0"
-			APPEND="yarvt.bootmode=nvme"
-		elif [[ ! -e "${BACKEND}" ]]; then
-			pr_inf "Creating ${NVME_SIZE} disk image ${BACKEND}..."
-			truncate -s ${NVME_SIZE} "${BACKEND}"
-			if [[ $? != 0 ]]; then
-				pr_err "Couldn't create disk image ${BACKEND}"
-				KEEP_LOGS=0
-				exit -1
+		elif [[ -f "${BACKEND}" ]] || [[ ! -e "${BACKEND}" ]]; then
+			if [[ ! -e "${BACKEND}" ]]; then
+				pr_inf "Creating ${DISK_SIZE} disk image ${BACKEND}..."
+				truncate -s ${DISK_SIZE} "${BACKEND}"
+				if [[ $? != 0 ]]; then
+					pr_err "Couldn't create disk image ${BACKEND}"
+					KEEP_LOGS=0
+					exit -1
+				fi
 			fi
-			NVME_ARGS="-drive file=${BACKEND},if=none,id=nvm0,format=raw"
-			NVME_ARGS="${NVME_ARGS} -device nvme,serial=YRVT0000000000000001,drive=nvm0"
-			APPEND="yarvt.bootmode=nvme"
+			DISK_ARGS="-drive file=${BACKEND},if=none,id=disk0,format=raw,cache=unsafe,discard=unmap,detect-zeroes=unmap"
+			if [[ "${QEMU_VIRT_FORCE_NVME}" != "" ]]; then
+				pr_inf "Using ${BACKEND} as an NVMe device (QEMU_VIRT_FORCE_NVME)"
+				DISK_ARGS="${DISK_ARGS} -device nvme,serial=YRVT0000000000000001,drive=disk0"
+			else
+				pr_inf "Using ${BACKEND} as a virtio-blk device"
+				DISK_ARGS="${DISK_ARGS} -device virtio-blk-device,serial=YRVT0000000000000001,drive=disk0"
+			fi
+			APPEND="yarvt.bootmode=disk"
 		else
 			pr_err "'${BACKEND}' is not a valid backend (raw image or NFS directory)"
 			KEEP_LOGS=0
@@ -127,7 +134,7 @@ function run_linux () {
 		-net user \
 		-object rng-random,filename=/dev/urandom,id=rng0 \
 		-device virtio-rng-device,rng=rng0 \
-		${NVME_ARGS} \
+		${DISK_ARGS} \
 		-bios ${BIOS} \
 		-kernel ${LINUX_INSTALL_DIR}/Image \
 		-initrd ${ROOTFS_INSTALL_DIR}/initramfs.img \

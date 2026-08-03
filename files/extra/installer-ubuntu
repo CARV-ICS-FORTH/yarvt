@@ -28,8 +28,6 @@ function download_initrootfs () {
 }
 
 function initialize_rootfs () {
-	local SAVED_PWD=${PWD}
-
 	pr_ann "Initializing rootfs"
 
 	pr_inf "Installing kernel modules"
@@ -82,16 +80,26 @@ function initialize_rootfs () {
 	pr_inf "Updating package list"
 	run_in_chroot apt-get update
 
-	pr_inf "Configuring systemd-networkd (networking configured by kernel)"
-	echo -e "[Match]\nName=eth0\n\n[Network]\nDHCP=ipv4\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\n" > ${PREFIX}/etc/systemd/network/20-eth0.network
-	echo -e "[Match]\nName=eth1\n\n[Link]\nUnmanaged=yes\n" > ${PREFIX}/etc/systemd/network/10-ignore-eth1.network
-	run_in_chroot systemctl enable systemd-networkd
-
-	pr_inf "Disabling systemd-resolved (hardcoded namsesrvers by default)"
-	run_in_chroot systemctl disable systemd-resolved
-
-	pr_inf "Preventing systemd-udevd from modifying mac addresses asigned by kernel"
-	ln -s /dev/null ${PREFIX}/etc/systemd/network/99-default.link
+	# Networking is ours to manage only on a local-disk boot, where nothing set it
+	# up for us: full DHCP on eth0 via networkd, DNS via resolved. Over NFS the
+	# initramfs already brought eth0 up and the root rides on it, so keep
+	# networkd/resolved disabled - they'd only fight what the initramfs did, and we
+	# keep the static resolv.conf prepare_chroot left behind.
+	if target_is_local; then
+		pr_inf "Configuring systemd-networkd + systemd-resolved"
+		echo -e "[Match]\nName=eth0\n\n[Network]\nDHCP=ipv4\n" > ${PREFIX}/etc/systemd/network/20-eth0.network
+		# Mask the default .link so udev keeps the kernel's eth0 name (and MAC)
+		# instead of renaming it - otherwise the Name=eth0 match above won't apply.
+		ln -s /dev/null ${PREFIX}/etc/systemd/network/99-default.link
+		run_in_chroot systemctl enable systemd-networkd
+		run_in_chroot systemctl enable systemd-resolved
+		# Hand resolv.conf back to resolved (prepare_chroot left a static copy).
+		ln -sf ../run/systemd/resolve/stub-resolv.conf ${PREFIX}/etc/resolv.conf
+	else
+		pr_inf "Keeping systemd-networkd + systemd-resolved disabled (network from initramfs)"
+		run_in_chroot systemctl disable systemd-networkd
+		run_in_chroot systemctl disable systemd-resolved
+	fi
 
 	pr_inf "Disabling sysstat service"
 	run_in_chroot systemctl disable sysstat
@@ -100,20 +108,19 @@ function initialize_rootfs () {
 	run_in_chroot dpkg-reconfigure openssh-server
 	run_in_chroot systemctl enable ssh
 
-	pr_inf "Downloading BSC RISC-V LLVM toolchain"
-	run_in_chroot wget https://admin.hca.bsc.es/epi/ftp/llvm-EPI-development-toolchain-native-latest.tar.bz2 -P /opt
-
-	pr_inf "Installing BSC RISC-V LLVM toolchain"
-	cd ${PREFIX}/opt
-	tar xvjf llvm-EPI-development-toolchain-native-latest.tar.bz2
-	chown -R root:root llvm-EPI-development-toolchain-native/
-	rm llvm-EPI-development-toolchain-native-latest.tar.bz2
-	echo "export PATH=\${PATH}:/opt/llvm-EPI-development-toolchain-native/bin" >> ${PREFIX}/etc/bash.bashrc
-	run_in_chroot apt install libatomic1
-	cd ${SAVED_PWD}
-
 	pr_inf "Installing dev environment packages"
 	run_in_chroot apt-get install -y build-essential device-tree-compiler bison flex mpich autoconf automake gperf libtool net-tools
+
+	# On a local-disk install, fstab is what actually mounts things on our current
+	# -kernel/busybox-initramfs boot: systemd's DPS gpt-auto-generator runs before
+	# any udev, so it can't enumerate the disk that early. We still lay down
+	# everything DPS needs - type GUIDs, emptied mountpoints, and /var's
+	# machine-id-keyed PARTUUID - so a future UEFI boot auto-mounts as-is. Over NFS
+	# there are no local partitions, so the empty fstab above is all that's needed.
+	if target_is_local; then
+		write_fstab
+		set_var_partuuid
+	fi
 }
 
 ########
